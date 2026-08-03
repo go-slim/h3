@@ -1,3 +1,3 @@
-module github.com/h3go/h3
+module go-slim.dev/h3
 
 go 1.25.5

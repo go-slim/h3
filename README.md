@@ -1,370 +1,414 @@
-# H3
+# h3
 
-H3 is a lightweight, high-performance Go HTTP framework built on Go 1.22+ enhanced routing features.
+[简体中文](README_CN.md)
 
-[中文](README_CN.md) | English
+`go-slim.dev/h3` is a small HTTP application foundation built on the Go
+standard library. It retains `http.ServeMux` route syntax and matching
+behavior while adding a declarative route tree, middleware composition,
+component lifecycle management, HTTP/HTTPS startup, and final response
+metadata.
 
-## Features
+h3 intentionally leaves custom request contexts, binding, content
+negotiation, rendering, validation, business error mapping, and tracing to
+focused packages, standard `net/http` middleware, and `context.Context`.
 
-- 🚀 **Standard Library Based** - Uses Go 1.22+ `http.ServeMux` enhanced routing
-- 🧩 **Component Architecture** - Modular application structure through Component pattern
-- 🔄 **Lifecycle Management** - Servlet interface supports component startup and shutdown lifecycle
-- 🔌 **Middleware Support** - Onion model middleware chain, supports global and route-level middleware
-- 📊 **Response Wrapping** - Automatically captures HTTP status code, response size, and write status
-- ⚡ **Graceful Shutdown** - Built-in graceful shutdown support
-- 🎯 **Type Safe** - Fully type-safe with zero reflection
+## Design principles
 
-## Installation
+- **Standard library first:** route patterns, requests, response writers, and
+  contexts retain their `net/http` semantics. h3 adds composition and
+  lifecycle management instead of introducing a second HTTP abstraction.
+- **Configuration is separate from serving:** one writer configures a Router;
+  `Build` creates an immutable snapshot, and requests atomically read that
+  snapshot. Locking one map could remove a local race, but cannot define an
+  atomic mutation across recursive mounts, shared child Routers, and user
+  middleware factories. Full support would require tree-wide snapshots,
+  ownership, and lock ordering disproportionate to startup-oriented
+  configuration, so mutable configuration is intentionally not
+  concurrency-safe while the request path remains lock-free.
+- **One lifecycle owner:** App `Start` and `Stop` are sequential control-plane
+  operations. Concurrent lifecycle transitions have no single correct order,
+  and a mutex cannot define that order for Servlets or user callbacks. One
+  application control flow should own lifecycle transitions; HTTP request
+  handling remains concurrent.
+- **Context does not implicitly own runtime:** the Context passed to `Start`
+  controls startup checks and rollback. A running App is finalized by `Stop`
+  or by the HTTP service exiting, avoiding accidental cancellation of every
+  request when an initialization Context is cancelled.
+- **Boundary wrappers stay small:** Response records one final response status
+  and size. Interim responses, hijacked connections, and advanced protocol
+  details remain accessible through `Unwrap` and `http.ResponseController`.
 
-```bash
-go get github.com/h3go/h3
+## Requirements and installation
+
+h3 requires Go 1.25.5 or later. Route patterns use the `http.ServeMux` syntax
+introduced in Go 1.22.
+
+```sh
+go get go-slim.dev/h3
 ```
 
-**Requirements**: Go 1.25.5 or higher
+## Quick start
 
-## Quick Start
+`App.Start` starts the HTTP server in the background. Keep the process alive
+in application code and call `App.Stop` explicitly when it should shut down.
 
 ```go
 package main
 
 import (
-    "net/http"
-    "github.com/h3go/h3"
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"go-slim.dev/h3"
 )
 
 func main() {
-    // Create router
-    mux := h3.NewMux()
-    
-    // Register routes
-    mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
-        w.Write([]byte("Hello, H3!"))
-    })
-    
-    mux.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
-        id := r.PathValue("id")
-        w.Write([]byte("User ID: " + id))
-    })
-    
-    // Start app
-    app := h3.New(mux, h3.Options{Addr: ":8080"})
-    app.Start()
+	app := h3.New(h3.Options{Addr: ":8080"})
+	app.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("user=" + r.PathValue("id")))
+	})
+
+	if err := app.Start(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	<-signals
+
+	if err := app.Stop(); err != nil {
+		log.Fatal(err)
+	}
 }
 ```
 
-## Core Concepts
+## Router
 
-### 1. Mux (Router)
-
-Mux is H3's core router, wrapping Go 1.22+ `http.ServeMux`:
+`Router` records routes, middleware, and child routers. `Build` compiles the
+complete declaration into a new `http.ServeMux` and publishes it atomically.
 
 ```go
-mux := h3.NewMux()
-
-// Register handlers
-mux.Handle("GET /api/users", usersHandler)
-mux.HandleFunc("POST /api/users", createUser)
-
-// Mount sub-router
-apiMux := h3.NewMux()
-apiMux.HandleFunc("GET /status", getStatus)
-mux.Mount("/api", apiMux)
+router := h3.NewRouter()
+router.HandleFunc("GET /users", listUsers)
+router.HandleFunc("GET /users/{id}", getUser)
+router.HandleFunc("POST /users", createUser)
+router.HandleFunc("GET /files/{path...}", serveFile)
+router.Build()
 ```
 
-### 2. Component
-
-Component is an independently registerable routing module for organizing large applications:
+The standard library populates path values:
 
 ```go
-// Create users module
-usersComponent := h3.NewComponent("/users")
-usersComponent.Mux().HandleFunc("GET /", listUsers)
-usersComponent.Mux().HandleFunc("GET /{id}", getUser)
-usersComponent.Mux().HandleFunc("POST /", createUser)
-
-// Create admin module
-adminComponent := h3.NewComponent("/admin")
-adminComponent.Mux().HandleFunc("GET /dashboard", dashboard)
-
-// Register to server
-app := h3.New(h3.NewMux(), h3.Options{Addr: ":8080"})
-app.Register(usersComponent)
-app.Register(adminComponent)
-app.Start()
+func getUser(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	_, _ = w.Write([]byte(id))
+}
 ```
 
-### 3. Response (Response Wrapper)
+Before its first `Build`, a Router behaves like an empty `http.ServeMux` and
+returns 404. Configuration changes require another `Build`; requests that
+already selected the previous routing table continue using that table.
 
-Response automatically wraps `http.ResponseWriter` to capture response information:
+Router configuration is not concurrency-safe. Do not concurrently call
+`Use`, `Handle`, `HandleFunc`, `Mount`, or `Build`. A published, read-only
+routing table can serve requests concurrently. `Build` may also run alongside
+requests when no configuration writes occur.
+
+### Duplicate configuration policy
+
+- A later `Handle` or `HandleFunc` with the same pattern string replaces the
+  previous handler.
+- A later `Mount` with the same normalized prefix replaces the previous child;
+  `/api` and `/api/` are the same prefix.
+- Different strings that ultimately conflict under `http.ServeMux` are still
+  detected by `Build`, which panics. A failed build does not replace the
+  routing table that is already published.
+
+### Mounting and complete patterns
+
+`Mount` expands child patterns during compilation. It does not use
+`http.StripPrefix`, so handlers see the original request URL and `r.Pattern`
+contains every mount prefix.
 
 ```go
-mux.Use(func(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        rw := h3.NewResponse(w)
-        next.ServeHTTP(rw, r)
-        
-        // Log response information
-        log.Printf("Status: %d, Size: %d bytes, Committed: %v",
-            rw.Status(), rw.Size(), rw.Committed())
-    })
+api := h3.NewRouter()
+api.HandleFunc("GET /health", health)
+
+root := h3.NewRouter()
+root.Mount("/api", api)
+root.Build()
+// Final pattern: GET /api/health
+```
+
+Host-qualified standard-library patterns can also be mounted. Only the path
+receives the prefix; the method and host remain unchanged:
+
+```go
+tenant := h3.NewRouter()
+tenant.HandleFunc("GET example.com/users", users)
+
+root.Mount("/api", tenant)
+root.Build()
+// Final pattern: GET example.com/api/users
+```
+
+A mount prefix is always a path: `"api"` is normalized to `"/api"`. Child
+route patterns follow ServeMux grammar: in `"GET api/users"`, `api` is a host;
+a path must be written as `"GET /api/users"`.
+
+Mounting a nil Router, a direct cycle, or an indirect cycle panics immediately.
+Building a parent publishes only the parent's complete routing table; it does
+not publish the child Router's standalone table. Call `Build` on a child
+explicitly when it must also serve independently.
+
+### Middleware
+
+Middleware uses the standard `func(http.Handler) http.Handler` shape. Earlier
+middleware is outermost, and parent Router middleware wraps child Router
+middleware.
+
+```go
+func requestLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("started method=%s path=%s", r.Method, r.URL.Path)
+		next.ServeHTTP(w, r)
+		log.Printf("finished method=%s path=%s", r.Method, r.URL.Path)
+	})
+}
+
+router.Use(requestLog)
+```
+
+`Use` records middleware. `Build` and `CompileRoutes` construct a fixed
+handler chain for every final route, so middleware factories are not called
+during requests. A nil middleware panics in `Use`; a factory that returns a
+nil handler panics during compilation. Middleware itself must synchronize any
+state captured and shared across requests; request-local state belongs inside
+`ServeHTTP`.
+
+### CompileRoutes
+
+`CompileRoutes` returns `[]h3.Route` with mount prefixes expanded and
+middleware already composed. It is useful when registering h3 declarations
+with another facility compatible with `http.ServeMux`. Result order is
+undefined because declarations are stored in maps. Most applications should
+simply call `Build`.
+
+## App lifecycle
+
+`App` combines a Router, `http.Server`, and Servlets, and itself implements
+`Servlet`.
+
+- `Start(ctx)` builds routes, synchronously creates the TCP listener, starts
+  Servlets, and then runs HTTP or HTTPS in the background. It is non-blocking.
+- Because the listener is created before `Start` returns, invalid addresses,
+  permission failures, and occupied ports are reported reliably.
+- `Stop()` first calls `http.Server.Shutdown`, waits for in-flight requests,
+  then calls every `Servlet.Stop` in reverse registration order, returning all
+  shutdown errors as one error.
+- After `Stop` completes, the same App may be started again.
+- `Options.OnStopped` is called once after the HTTP service exits and every
+  Servlet has stopped. Its `manual` argument is true only when `Stop`
+  initiated shutdown. Its error joins serving, shutdown, and Servlet stop
+  errors.
+
+The Context passed to `Start` controls Servlet startup and initialization, such
+as a database connectivity check. App checks cancellation before startup and
+before and after each Servlet starts. If cancellation is observed before
+startup completes, App closes the listener and stops every successfully
+started Servlet in reverse order. Cancelling that Context after `Start`
+succeeds does not stop the running App; runtime shutdown remains explicit
+through `Stop`.
+
+An unexpected error after the HTTP serving loop has started is written to
+`Options.ErrorLog` (or the standard logger). App then shuts down the HTTP
+server, stops every Servlet in reverse order, and invokes `OnStopped` with
+`manual=false` and the combined error. Startup failures reported directly by
+`Start` do not invoke `OnStopped`.
+
+Lifecycle operations are intentionally sequential and lock-free: do not call
+`Start` and `Stop` concurrently. Calling `Start` while the App is running
+returns an error; calling `Stop` while it is not running returns nil. This
+constraint does not limit concurrent HTTP handlers; it only requires one
+application control flow to own App lifecycle transitions.
+
+`OnStopped` runs after every Servlet has stopped, but a manual `Stop` does not
+wait for the callback to finish. It is a completion notification rather than
+a second resource-cleanup hook. Because the App can be started again after
+`Stop` returns, the callback may overlap the next run. Use `Run`, or wait for
+the callback explicitly, when runs must be strictly separated.
+
+```go
+if err := app.Start(context.Background()); err != nil {
+	return err
+}
+// ...
+return app.Stop()
+```
+
+For development and other blocking entry points, `Run` combines `Start` with
+waiting for `OnStopped` and returns the same final error. It preserves and
+invokes an already configured callback. Its Context still controls only
+startup; cancelling it after startup does not stop the App.
+Call `Run` only for an App that is not running, and do not run it concurrently
+with other lifecycle operations.
+
+```go
+if err := h3.Run(context.Background(), app); err != nil {
+	log.Fatal(err)
+}
+```
+
+## Component and Servlet
+
+A `Component` consists of a mount prefix and child Router. `App.Register`
+mounts its routes. If the component also implements `Servlet`, App manages its
+startup and shutdown.
+
+Register components only while the App is stopped, and do not reuse a mount
+prefix. Repeated `Router.Mount` calls can mean "replace this route declaration
+before building." A Component may also own a Servlet; replacing only its
+routes would leave the old resource in the lifecycle list. `Register`
+therefore panics on duplicate prefixes to keep route ownership and resource
+ownership aligned.
+
+```go
+type workerComponent struct {
+	h3.Component
+}
+
+func newWorkerComponent() *workerComponent {
+	component := &workerComponent{Component: h3.NewComponent("/workers")}
+	component.Router().HandleFunc("GET /status", workerStatus)
+	return component
+}
+
+func (c *workerComponent) Start(ctx context.Context) error {
+	// Initialize resources or perform startup checks.
+	return nil
+}
+
+func (c *workerComponent) Stop() error {
+	// Stop background work and release resources.
+	return nil
+}
+
+app.Register(newWorkerComponent())
+```
+
+Embed `h3.Component`, not `*h3.Component`: `Component` is an interface and
+`NewComponent` returns an implementation of it.
+
+## TLS
+
+A non-nil `Options.TLSConfig` makes App serve HTTPS with
+`http.Server.ServeTLS`. The configuration must provide a server certificate
+through `Certificates`, `GetCertificate`, or `GetConfigForClient`; otherwise
+`Start` returns an error before creating the listener.
+
+```go
+certificate, err := tls.LoadX509KeyPair("server.crt", "server.key")
+if err != nil {
+	return err
+}
+
+app := h3.New(h3.Options{
+	Addr: ":8443",
+	TLSConfig: &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{certificate},
+	},
 })
 ```
 
-Response interface supports advanced features:
+An empty `Addr` still uses `:http`; applications enabling TLS will usually set
+an explicit HTTPS address.
+
+## Response
+
+App wraps the `http.ResponseWriter` passed to handlers as `h3.Response`, which
+records the final status, response body bytes, and commit state. A standalone
+Router does not wrap the writer; callers can use `h3.NewResponse` explicitly
+when metadata is needed.
 
 ```go
-// HTTP/2 Server Push
-rw.Push("/static/style.css", nil)
-
-// Streaming response (SSE)
-fmt.Fprintf(rw, "data: %s\n\n", message)
-rw.Flush()
-
-// WebSocket upgrade
-conn, buf, err := rw.Hijack()
+func responseLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r)
+		response := w.(h3.Response)
+		log.Printf(
+			"status=%d size=%d committed=%t",
+			response.Status(), response.Size(), response.Committed(),
+		)
+	})
+}
 ```
 
-### 4. Servlet (Service Component)
+`NewResponse` is idempotent. `Response` also provides `Flush`, `Hijack`,
+`Push`, and `Unwrap`:
 
-Servlet is an optional interface for managing component lifecycle. Components implementing this interface can automatically initialize and cleanup resources during server startup and shutdown:
+- `Hijack` and `Push` return an error when the underlying writer does not
+  support them.
+- `Flush` retains the `http.Flusher` signature and panics when the underlying
+  writer cannot flush.
+- Response records one final status. Write interim responses such as
+  `100 Continue` or `103 Early Hints` through `Unwrap`, then write the final
+  response through Response.
 
 ```go
-type DatabaseComponent struct {
-    *h3.Component
-    db *sql.DB
-}
-
-func (c *DatabaseComponent) Start(ctx context.Context) error {
-    // Connect to database on server startup
-    db, err := sql.Open("postgres", "connection-string")
-    if err != nil {
-        return err
-    }
-    c.db = db
-    return db.PingContext(ctx)
-}
-
-func (c *DatabaseComponent) Stop() error {
-    // Disconnect database on app shutdown
-    if c.db != nil {
-        return c.db.Close()
-    }
-    return nil
-}
-
-// Register component implementing Servlet
-app := h3.New(h3.NewMux(), h3.Options{Addr: ":8080"})
-app.Register(dbComponent) // Start is called automatically
-// ... server running
-app.Stop(ctx)             // Stop is called automatically
+response := w.(h3.Response)
+response.Unwrap().WriteHeader(http.StatusEarlyHints)
+response.WriteHeader(http.StatusOK)
 ```
 
-**Servlet Features**:
-- ✅ Automatic lifecycle management
-- ✅ Start is called before HTTP server starts
-- ✅ Stop is called in reverse registration order (LIFO)
-- ✅ Start failure prevents server startup
-- ✅ Stop is idempotent, can be safely called multiple times
+h3 does not attempt to emulate every optional `http.ResponseWriter` capability
+or protocol detail. Advanced code can use the underlying writer through
+`Unwrap` or `http.ResponseController`.
 
-**Common Use Cases**:
-- Database connection pool initialization and cleanup
-- Message queue connection management
-- Background task startup and shutdown
-- Scheduled task management
-- Cache system initialization
+Like the standard `http.ResponseWriter`, Response does not support
+unsynchronized concurrent writes. Locking only its counters would not define
+correct Header and body commit ordering across goroutines; callers generating
+content concurrently should aggregate or synchronize before writing.
 
-### 5. Middleware
+## Server options
 
-Middleware uses the standard `func(http.Handler) http.Handler` signature:
+`Options` maps supported `http.Server` settings, including the listen address,
+read/write/idle timeouts, TLS, connection-state hooks, serving completion,
+error logging, HTTP/2 configuration, and protocols.
 
 ```go
-// Custom middleware
-func Logger(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        start := time.Now()
-        next.ServeHTTP(w, r)
-        log.Printf("%s %s - %v", r.Method, r.URL.Path, time.Since(start))
-    })
-}
-
-// Use middleware
-mux.Use(Logger)
+app := h3.New(h3.Options{
+	Router:            router,
+	Addr:              ":8080",
+	ReadHeaderTimeout: 5 * time.Second,
+	IdleTimeout:       60 * time.Second,
+	OnStopped: func(manual bool, err error) {
+		if !manual {
+			log.Printf("HTTP server exited: %v", err)
+		}
+	},
+})
 ```
 
-Middleware execution follows the onion model:
+## What h3 does not provide
 
-```
-Request → M1 → M2 → M3 → Handler → M3 → M2 → M1 → Response
-```
+h3 has no custom request Context, binder, renderer, validator, central error
+pipeline, or tracing implementation. Keep request-scoped data in
+`r.Context()`. For example, `go-slim.dev/binding` can bind request input and
+`go-slim.dev/nego` can handle media-type matching and Accept negotiation.
 
-## Complete Examples
+## Verification
 
-### Modular Application
-
-```go
-package main
-
-import (
-    "encoding/json"
-    "net/http"
-    "github.com/h3go/h3"
-)
-
-// Users module
-func NewUsersComponent() h3.Component {
-    c := h3.NewComponent("/users")
-    mux := c.Mux()
-    
-    // List users
-    mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
-        users := []map[string]string{
-            {"id": "1", "name": "Alice"},
-            {"id": "2", "name": "Bob"},
-        }
-        json.NewEncoder(w).Encode(users)
-    })
-    
-    // User details
-    mux.HandleFunc("GET /{id}", func(w http.ResponseWriter, r *http.Request) {
-        id := r.PathValue("id")
-        user := map[string]string{"id": id, "name": "User " + id}
-        json.NewEncoder(w).Encode(user)
-    })
-    
-    return c
-}
-
-// Admin module
-func NewAdminComponent() h3.Component {
-    c := h3.NewComponent("/admin")
-    mux := c.Mux()
-    
-    // Admin-specific middleware
-    mux.Use(func(next http.Handler) http.Handler {
-        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            // Permission check
-            token := r.Header.Get("Authorization")
-            if token == "" {
-                http.Error(w, "Unauthorized", http.StatusUnauthorized)
-                return
-            }
-            next.ServeHTTP(w, r)
-        })
-    })
-    
-    mux.HandleFunc("GET /dashboard", func(w http.ResponseWriter, r *http.Request) {
-        w.Write([]byte("Admin Dashboard"))
-    })
-    
-    return c
-}
-
-func main() {
-    // Create root router
-    mux := h3.NewMux()
-    
-    // Root route
-    mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
-        w.Write([]byte("Welcome to H3!"))
-    })
-    
-    // Create app and register components
-    app := h3.New(mux, h3.Options{Addr: ":8080"})
-    app.Register(NewUsersComponent())
-    app.Register(NewAdminComponent())
-    
-    // Start app
-    app.Start()
-}
-```
-
-### Graceful Shutdown
-
-```go
-func main() {
-    mux := h3.NewMux()
-    mux.HandleFunc("GET /", handler)
-    
-    app := h3.New(mux, h3.Options{Addr: ":8080"})
-    
-    // Start in goroutine
-    go app.Start()
-    
-    // Wait for signal
-    sigChan := make(chan os.Signal, 1)
-    signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-    <-sigChan
-    
-    // Graceful shutdown
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-    defer cancel()
-    
-    if err := app.Stop(ctx); err != nil {
-        log.Printf("Server shutdown error: %v", err)
-    }
-}
-```
-
-## Routing Patterns
-
-H3 uses Go 1.22+ routing pattern syntax:
-
-```go
-mux.HandleFunc("GET /users", listUsers)              // Exact match
-mux.HandleFunc("GET /users/{id}", getUser)           // Path parameter
-mux.HandleFunc("GET /files/{path...}", serveFile)    // Wildcard
-mux.HandleFunc("POST /users", createUser)            // Method match
-mux.HandleFunc("/about", about)                      // All methods
-```
-
-Access path parameters:
-
-```go
-func handler(w http.ResponseWriter, r *http.Request) {
-    id := r.PathValue("id")
-    path := r.PathValue("path")
-}
-```
-
-## Performance
-
-H3 is directly based on the standard library's `http.ServeMux`, with performance close to native Go HTTP server:
-
-- Zero reflection
-- Minimal memory allocation
-- Efficient route matching
-- Lightweight middleware chain
-
-## Testing
-
-```bash
-# Run all tests
+```sh
 go test ./...
-
-# Run tests with coverage
-go test -cover ./...
-
-# Verbose test output
-go test -v ./...
+go vet ./...
+go test -race ./...
 ```
-
-Current test coverage: **95.4%**
-
-## Framework Comparison
-
-| Feature | H3 | Chi | Echo | Gin |
-|---------|-----|-----|------|-----|
-| Standard Library Based | ✅ | ✅ | ❌ | ❌ |
-| Go 1.22+ Routing | ✅ | ❌ | ❌ | ❌ |
-| Zero Reflection | ✅ | ✅ | ❌ | ❌ |
-| Component Architecture | ✅ | ❌ | ❌ | ❌ |
-| Graceful Shutdown | ✅ | ✅ | ✅ | ✅ |
-| Middleware | ✅ | ✅ | ✅ | ✅ |
 
 ## License
 
-MIT License
-
-## Contributing
-
-Issues and Pull Requests are welcome!
+MIT. See [LICENSE](LICENSE).

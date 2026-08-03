@@ -33,7 +33,7 @@ var (
 //   - Status() int: 获取 HTTP 响应状态码
 //   - Committed() bool: 检查响应是否已提交
 //   - Size() int64: 获取已写入的字节数
-//   - Unwrap() http.ResponseWriter: 获取被包装的原始 ResponseWriter
+//   - Unwrap() http.ResponseWriter: 获取直接被包装的 ResponseWriter
 //   - Push(target, opts) error: HTTP/2 服务器推送
 //
 // 重要特性:
@@ -42,6 +42,19 @@ var (
 //   - 跟踪响应是否已提交（WriteHeader 或 Write 被调用）
 //   - 防止重复写入响应头
 //   - 支持 WebSocket、SSE、HTTP/2 推送等高级特性
+//
+// Response 只跟踪一个最终响应状态，不建模多个临时 1xx 响应。需要发送
+// 100 Continue、103 Early Hints 等临时响应时，调用方应通过 [Response.Unwrap]
+// 直接操作底层 ResponseWriter，再使用 Response 写入最终响应。
+//
+// Response 遵循 net/http 中由单个 handler 拥有 ResponseWriter 的模型，
+// 不为并发写入 Header、WriteHeader 或 Write 加锁。锁只能避免字段竞争，
+// 不能为多个 goroutine 定义正确的 HTTP 提交顺序；需要并发生成内容时，
+// 调用方应在写入 Response 前自行汇总或同步。
+//
+// 为兼容仍通过类型断言查找可选接口的库，Response 始终实现
+// http.Flusher、http.Hijacker 和 http.Pusher。这不表示底层 writer 必然
+// 支持对应功能；调用结果仍取决于底层 writer。
 //
 // 使用场景:
 //   - 中间件需要记录响应状态和大小
@@ -84,9 +97,9 @@ type Response interface {
 	// 一旦响应提交，就无法再修改状态码。
 	Committed() bool
 
-	// Unwrap 返回原始的 http.ResponseWriter
+	// Unwrap 返回直接被包装的 http.ResponseWriter
 	//
-	// ResponseController 可以用来访问原始的 http.ResponseWriter。
+	// ResponseController 可以通过这个方法继续向内解包 ResponseWriter。
 	// 参见 [https://go.dev/blog/go1.20]
 	Unwrap() http.ResponseWriter
 }
@@ -128,20 +141,24 @@ func (r *response) Committed() bool {
 	return r.committed
 }
 
-// Unwrap 返回原始的 http.ResponseWriter
+// Unwrap 返回直接被包装的 http.ResponseWriter
 func (r *response) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
 
 // WriteHeader 拦截并记录状态码
 //
-// 此方法会记录状态码并标记响应为已提交。
+// 此方法会记录一个最终状态码并标记响应为已提交。
 // 如果响应已经提交（WriteHeader 或 Write 已被调用），
 // 再次调用此方法会被忽略并记录错误日志。
 //
+// Response 将第一次 WriteHeader 调用视为最终响应，因此不表示或统计可重复的
+// 1xx 临时响应。需要 100 Continue、103 Early Hints 等细节时，请调用
+// [Response.Unwrap] 直接写入临时响应；之后再通过本方法或 Write 写入最终响应。
+//
 // 注意:
-//   - HTTP 协议规定响应头只能发送一次
-//   - 多次调用 WriteHeader 是编程错误，应该避免
+//   - 最终响应头只能发送一次；1xx 临时响应是例外
+//   - 对最终响应多次调用 WriteHeader 是编程错误，应该避免
 //   - 标准库的行为是忽略后续调用（但可能记录警告）
 func (r *response) WriteHeader(code int) {
 	if r.committed {

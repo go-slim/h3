@@ -29,19 +29,19 @@ func TestNewComponent(t *testing.T) {
 				t.Errorf("Prefix() = %q, want %q", c.Prefix(), tt.prefix)
 			}
 
-			if c.Mux() == nil {
-				t.Error("Mux() returned nil")
+			if c.Router() == nil {
+				t.Error("Router() returned nil")
 			}
 		})
 	}
 }
 
-func TestComponentMux(t *testing.T) {
+func TestComponentRouter(t *testing.T) {
 	c := NewComponent("/api")
-	mux := c.Mux()
+	mux := c.Router()
 
 	if mux == nil {
-		t.Fatal("Mux() returned nil")
+		t.Fatal("Router() returned nil")
 	}
 
 	// Verify the mux is functional
@@ -49,6 +49,7 @@ func TestComponentMux(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("test"))
 	})
+	mux.Build()
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	rec := httptest.NewRecorder()
@@ -86,16 +87,17 @@ func TestComponentPrefix(t *testing.T) {
 func TestComponentIntegration(t *testing.T) {
 	// Create component with routes
 	c := NewComponent("/api")
-	c.Mux().HandleFunc("GET /users", func(w http.ResponseWriter, r *http.Request) {
+	c.Router().HandleFunc("GET /users", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("users list"))
 	})
-	c.Mux().HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+	c.Router().HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("user " + r.PathValue("id")))
 	})
 
 	// Create server and register component
-	mux := NewMux()
-	mux.Mount(c.Prefix(), c.Mux())
+	mux := NewRouter()
+	mux.Mount(c.Prefix(), c.Router())
+	mux.Build()
 
 	tests := []struct {
 		path string
@@ -128,7 +130,7 @@ func TestComponentWithMiddleware(t *testing.T) {
 
 	// Add middleware to component's mux
 	called := false
-	c.Mux().Use(func(next http.Handler) http.Handler {
+	c.Router().Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			called = true
 			w.Header().Set("X-Middleware", "executed")
@@ -136,14 +138,15 @@ func TestComponentWithMiddleware(t *testing.T) {
 		})
 	})
 
-	c.Mux().HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
+	c.Router().HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	rec := httptest.NewRecorder()
 
-	c.Mux().ServeHTTP(rec, req)
+	c.Router().Build()
+	c.Router().ServeHTTP(rec, req)
 
 	if !called {
 		t.Error("middleware was not called")
@@ -157,19 +160,20 @@ func TestComponentWithMiddleware(t *testing.T) {
 func TestMultipleComponents(t *testing.T) {
 	// Create multiple components
 	apiComponent := NewComponent("/api")
-	apiComponent.Mux().HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
+	apiComponent.Router().HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("api ok"))
 	})
 
 	adminComponent := NewComponent("/admin")
-	adminComponent.Mux().HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
+	adminComponent.Router().HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("admin ok"))
 	})
 
 	// Mount both components
-	mux := NewMux()
-	mux.Mount(apiComponent.Prefix(), apiComponent.Mux())
-	mux.Mount(adminComponent.Prefix(), adminComponent.Mux())
+	mux := NewRouter()
+	mux.Mount(apiComponent.Prefix(), apiComponent.Router())
+	mux.Mount(adminComponent.Prefix(), adminComponent.Router())
+	mux.Build()
 
 	tests := []struct {
 		path string

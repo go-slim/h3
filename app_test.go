@@ -2,35 +2,51 @@ package h3
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
 )
 
 func TestNew(t *testing.T) {
-	mux := NewMux()
-	app := New(mux, Options{Addr: ":8080"})
+	mux := NewRouter()
+	app := New(Options{Router: mux, Addr: ":8080"})
 
 	if app == nil {
 		t.Fatal("New returned nil")
 	}
 
-	if app.opts.Addr != ":8080" {
-		t.Errorf("addr = %q, want %q", app.opts.Addr, ":8080")
+	if app.options.Addr != ":8080" {
+		t.Errorf("addr = %q, want %q", app.options.Addr, ":8080")
 	}
 
-	if app.mux == nil {
+	if app.router == nil {
 		t.Error("mux should not be nil")
 	}
 }
 
+func TestAppWrapsResponseWriter(t *testing.T) {
+	router := NewRouter()
+	router.HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := w.(Response); !ok {
+			t.Error("App should wrap ResponseWriter")
+		}
+	})
+
+	app := New(Options{Router: router})
+	router.Build()
+	app.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/test", nil))
+}
+
 func TestAppUse(t *testing.T) {
-	mux := NewMux()
-	app := New(mux, Options{Addr: ":8080"})
+	mux := NewRouter()
+	app := New(Options{Router: mux, Addr: ":8080"})
 
 	called := false
 	app.Use(func(next http.Handler) http.Handler {
@@ -41,7 +57,7 @@ func TestAppUse(t *testing.T) {
 	})
 
 	// Add a handler to test middleware
-	app.mux.HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
+	app.router.HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
 
@@ -50,7 +66,7 @@ func TestAppUse(t *testing.T) {
 	if err := app.Start(ctx); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
-	defer func() { _ = app.Stop(ctx) }()
+	defer func() { _ = app.Stop() }()
 
 	// Give server time to start
 	time.Sleep(100 * time.Millisecond)
@@ -67,12 +83,12 @@ func TestAppUse(t *testing.T) {
 }
 
 func TestAppRegister(t *testing.T) {
-	mux := NewMux()
-	app := New(mux, Options{Addr: ":8081"})
+	mux := NewRouter()
+	app := New(Options{Router: mux, Addr: ":8081"})
 
 	// Create a component
 	c := NewComponent("/api")
-	c.Mux().HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
+	c.Router().HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
 
@@ -84,7 +100,7 @@ func TestAppRegister(t *testing.T) {
 	if err := app.Start(ctx); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
-	defer func() { _ = app.Stop(ctx) }()
+	defer func() { _ = app.Stop() }()
 
 	// Give server time to start
 	time.Sleep(100 * time.Millisecond)
@@ -105,13 +121,52 @@ func TestAppRegister(t *testing.T) {
 	}
 }
 
+func TestAppRegisterRejectsAmbiguousLifecycleOwnership(t *testing.T) {
+	t.Run("nil component", func(t *testing.T) {
+		app := New()
+		defer func() {
+			if recovered := recover(); recovered != "h3: nil component" {
+				t.Fatalf("Register panic = %v, want h3: nil component", recovered)
+			}
+		}()
+		app.Register(nil)
+	})
+
+	t.Run("duplicate prefix", func(t *testing.T) {
+		app := New()
+		app.Register(NewComponent("/api/"))
+
+		defer func() {
+			if recover() == nil {
+				t.Fatal("Register should panic for a duplicate normalized prefix")
+			}
+		}()
+		app.Register(NewComponent("/api"))
+	})
+
+	t.Run("started app", func(t *testing.T) {
+		app := New(Options{Addr: "127.0.0.1:0"})
+		if err := app.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer func() { _ = app.Stop() }()
+
+		defer func() {
+			if recover() == nil {
+				t.Fatal("Register should panic while App is started")
+			}
+		}()
+		app.Register(NewComponent("/api"))
+	})
+}
+
 func TestAppStartStop(t *testing.T) {
-	mux := NewMux()
+	mux := NewRouter()
 	mux.HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("running"))
 	})
 
-	app := New(mux, Options{Addr: ":8082"})
+	app := New(Options{Router: mux, Addr: ":8082"})
 	ctx := context.Background()
 
 	// Start server
@@ -134,7 +189,7 @@ func TestAppStartStop(t *testing.T) {
 	}
 
 	// Stop server
-	if err := app.Stop(ctx); err != nil {
+	if err := app.Stop(); err != nil {
 		t.Fatalf("Stop failed: %v", err)
 	}
 
@@ -159,17 +214,124 @@ func TestAppInvalidAddress(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mux := NewMux()
-			app := New(mux, Options{Addr: tt.addr})
+			mux := NewRouter()
+			app := New(Options{Router: mux, Addr: tt.addr})
 			ctx := context.Background()
 
 			err := app.Start(ctx)
 			if err == nil {
-				_ = app.Stop(ctx)
+				_ = app.Stop()
 				t.Error("Start should fail with invalid address")
 			}
 		})
 	}
+}
+
+func TestAppStartReturnsListenErrorSynchronously(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	app := New(Options{Addr: listener.Addr().String()})
+	servlet := newMockServletComponent("/servlet")
+	app.Register(servlet)
+
+	err = app.Start(context.Background())
+	if err == nil {
+		t.Fatal("Start should return an error when the address is already in use")
+	}
+	if servlet.wasStartCalled() {
+		t.Fatal("Servlet.Start should not run when the listener cannot be created")
+	}
+}
+
+func TestAppStartRejectsTLSConfigWithoutCertificate(t *testing.T) {
+	app := New(Options{
+		Addr:      "127.0.0.1:0",
+		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	})
+
+	err := app.Start(context.Background())
+	if err == nil {
+		t.Fatal("Start should reject TLSConfig without a server certificate")
+	}
+}
+
+func TestAppServesTLSWhenConfigured(t *testing.T) {
+	certificateSource := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	client := certificateSource.Client()
+	config := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: certificateSource.TLS.Certificates,
+	}
+	certificateSource.Close()
+	defer client.CloseIdleConnections()
+
+	addr := unusedTestAddress(t)
+	router := NewRouter()
+	router.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("secure"))
+	})
+	app := New(Options{Router: router, Addr: addr, TLSConfig: config})
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatalf("Start TLS app: %v", err)
+	}
+	defer func() { _ = app.Stop() }()
+
+	response, err := client.Get("https://" + addr + "/")
+	if err != nil {
+		t.Fatalf("GET TLS app: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if got := string(body); got != "secure" {
+		t.Errorf("body = %q, want secure", got)
+	}
+}
+
+func TestAppCancelingStartupContextDoesNotStopStartedApp(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	addr := unusedTestAddress(t)
+	app := New(Options{Addr: addr})
+	app.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("running"))
+	})
+	if err := app.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = app.Stop() }()
+
+	cancel()
+	response, err := http.Get("http://" + addr + "/")
+	if err != nil {
+		t.Fatalf("GET after startup Context cancellation: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if got := string(body); got != "running" {
+		t.Errorf("body = %q, want running", got)
+	}
+}
+
+func unusedTestAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+	return addr
 }
 
 func TestAppValidAddress(t *testing.T) {
@@ -185,14 +347,14 @@ func TestAppValidAddress(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mux := NewMux()
-			app := New(mux, Options{Addr: tt.addr})
+			mux := NewRouter()
+			app := New(Options{Router: mux, Addr: tt.addr})
 			ctx := context.Background()
 
 			if err := app.Start(ctx); err != nil {
 				t.Fatalf("Start failed: %v", err)
 			}
-			defer func() { _ = app.Stop(ctx) }()
+			defer func() { _ = app.Stop() }()
 
 			time.Sleep(100 * time.Millisecond)
 
@@ -208,17 +370,17 @@ func TestAppValidAddress(t *testing.T) {
 }
 
 func TestAppMultipleComponents(t *testing.T) {
-	mux := NewMux()
-	app := New(mux, Options{Addr: ":8086"})
+	mux := NewRouter()
+	app := New(Options{Router: mux, Addr: ":8086"})
 
 	// Register multiple components
 	apiComponent := NewComponent("/api")
-	apiComponent.Mux().HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
+	apiComponent.Router().HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("api"))
 	})
 
 	adminComponent := NewComponent("/admin")
-	adminComponent.Mux().HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
+	adminComponent.Router().HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("admin"))
 	})
 
@@ -229,7 +391,7 @@ func TestAppMultipleComponents(t *testing.T) {
 	if err := app.Start(ctx); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
-	defer func() { _ = app.Stop(ctx) }()
+	defer func() { _ = app.Stop() }()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -262,7 +424,7 @@ func TestAppMultipleComponents(t *testing.T) {
 }
 
 func TestAppGracefulShutdown(t *testing.T) {
-	mux := NewMux()
+	mux := NewRouter()
 
 	// Add a slow handler
 	mux.HandleFunc("GET /slow", func(w http.ResponseWriter, r *http.Request) {
@@ -270,7 +432,7 @@ func TestAppGracefulShutdown(t *testing.T) {
 		w.Write([]byte("done"))
 	})
 
-	app := New(mux, Options{Addr: ":8087"})
+	app := New(Options{Router: mux, Addr: ":8087"})
 	ctx := context.Background()
 
 	if err := app.Start(ctx); err != nil {
@@ -295,7 +457,7 @@ func TestAppGracefulShutdown(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Stop server (should wait for slow request)
-	if err := app.Stop(ctx); err != nil {
+	if err := app.Stop(); err != nil {
 		t.Fatalf("Stop failed: %v", err)
 	}
 
@@ -309,7 +471,7 @@ func TestAppGracefulShutdown(t *testing.T) {
 }
 
 func TestAppContextPropagation(t *testing.T) {
-	mux := NewMux()
+	mux := NewRouter()
 
 	contextReceived := false
 	mux.HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
@@ -319,13 +481,13 @@ func TestAppContextPropagation(t *testing.T) {
 		w.Write([]byte("ok"))
 	})
 
-	app := New(mux, Options{Addr: ":8088"})
+	app := New(Options{Router: mux, Addr: ":8088"})
 	ctx := context.Background()
 
 	if err := app.Start(ctx); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
-	defer func() { _ = app.Stop(ctx) }()
+	defer func() { _ = app.Stop() }()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -341,8 +503,8 @@ func TestAppContextPropagation(t *testing.T) {
 }
 
 func TestAppWithMiddlewareAndComponents(t *testing.T) {
-	mux := NewMux()
-	app := New(mux, Options{Addr: ":8089"})
+	mux := NewRouter()
+	app := New(Options{Router: mux, Addr: ":8089"})
 
 	// Add global middleware
 	app.Use(func(next http.Handler) http.Handler {
@@ -354,14 +516,14 @@ func TestAppWithMiddlewareAndComponents(t *testing.T) {
 
 	// Create component with its own middleware
 	c := NewComponent("/api")
-	c.Mux().Use(func(next http.Handler) http.Handler {
+	c.Router().Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-Component", "true")
 			next.ServeHTTP(w, r)
 		})
 	})
 
-	c.Mux().HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
+	c.Router().HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
 
@@ -371,7 +533,7 @@ func TestAppWithMiddlewareAndComponents(t *testing.T) {
 	if err := app.Start(ctx); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
-	defer func() { _ = app.Stop(ctx) }()
+	defer func() { _ = app.Stop() }()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -391,39 +553,162 @@ func TestAppWithMiddlewareAndComponents(t *testing.T) {
 }
 
 func TestAppStartMultipleTimes(t *testing.T) {
-	mux := NewMux()
-	mux.HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
+	addr := unusedTestAddress(t)
+	router := NewRouter()
+	router.HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
 	})
+	serveDone := make(chan struct {
+		manual bool
+		err    error
+	}, 2)
 
-	app := New(mux, Options{Addr: ":8090"})
-	ctx := context.Background()
+	app := New(Options{
+		Router: router,
+		Addr:   addr,
+		OnStopped: func(manual bool, err error) {
+			serveDone <- struct {
+				manual bool
+				err    error
+			}{manual: manual, err: err}
+		},
+	})
+	client := &http.Client{Timeout: time.Second}
+	defer client.CloseIdleConnections()
 
-	// Start server
-	if err := app.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
+	request := func(cycle int) {
+		response, err := client.Get("http://" + addr + "/test")
+		if err != nil {
+			t.Fatalf("cycle %d GET: %v", cycle, err)
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatalf("cycle %d ReadAll: %v", cycle, err)
+		}
+		if got := string(body); got != "ok" {
+			t.Errorf("cycle %d body = %q, want ok", cycle, got)
+		}
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify server is running
-	resp, err := http.Get("http://localhost:8090/test")
-	if err != nil {
-		t.Fatalf("GET failed: %v", err)
+	for cycle := 1; cycle <= 2; cycle++ {
+		if err := app.Start(context.Background()); err != nil {
+			t.Fatalf("cycle %d Start: %v", cycle, err)
+		}
+		request(cycle)
+		if err := app.Stop(); err != nil {
+			t.Fatalf("cycle %d Stop: %v", cycle, err)
+		}
+		select {
+		case result := <-serveDone:
+			if !result.manual {
+				t.Errorf("cycle %d OnStopped manual = false", cycle)
+			}
+			if result.err != nil {
+				t.Errorf("cycle %d OnStopped error = %v", cycle, result.err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("cycle %d OnStopped was not called", cycle)
+		}
 	}
-	resp.Body.Close()
+}
 
-	// Stop server
-	if err := app.Stop(ctx); err != nil {
-		t.Fatalf("Stop failed: %v", err)
+func TestAppOnStoppedRunsAfterServletStop(t *testing.T) {
+	type stoppedResult struct {
+		manual         bool
+		err            error
+		servletStopped bool
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	servlet := newMockServletComponent("/servlet")
+	stopErr := errors.New("servlet stop failed")
+	servlet.stopError = stopErr
+	stopped := make(chan stoppedResult, 1)
+	app := New(Options{
+		Addr: "127.0.0.1:0",
+		OnStopped: func(manual bool, err error) {
+			stopped <- stoppedResult{
+				manual:         manual,
+				err:            err,
+				servletStopped: servlet.wasStopCalled(),
+			}
+		},
+	})
+	app.Register(servlet)
 
-	// Verify server is stopped
-	_, err = http.Get("http://localhost:8090/test")
-	if err == nil {
-		t.Error("expected error when connecting to stopped server")
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := app.Stop(); !errors.Is(err, stopErr) {
+		t.Fatalf("Stop error = %v, want %v", err, stopErr)
+	}
+
+	select {
+	case result := <-stopped:
+		if !result.manual {
+			t.Error("OnStopped manual = false, want true")
+		}
+		if !errors.Is(result.err, stopErr) {
+			t.Errorf("OnStopped error = %v, want %v", result.err, stopErr)
+		}
+		if !result.servletStopped {
+			t.Error("OnStopped ran before Servlet.Stop")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OnStopped was not called")
+	}
+}
+
+func TestAppStopDoesNotWaitForOnStopped(t *testing.T) {
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	app := New(Options{
+		Addr: "127.0.0.1:0",
+		OnStopped: func(bool, error) {
+			close(callbackStarted)
+			<-releaseCallback
+		},
+	})
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- app.Stop() }()
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	case <-time.After(time.Second):
+		close(releaseCallback)
+		t.Fatal("Stop waited for OnStopped")
+	}
+	select {
+	case <-callbackStarted:
+		close(releaseCallback)
+	case <-time.After(time.Second):
+		close(releaseCallback)
+		t.Fatal("OnStopped was not called")
+	}
+}
+
+func TestAppStartRejectsAlreadyStartedApp(t *testing.T) {
+	app := New(Options{Addr: "127.0.0.1:0"})
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+	defer func() { _ = app.Stop() }()
+
+	err := app.Start(context.Background())
+	if err == nil || err.Error() != "h3: app is already started" {
+		t.Fatalf("second Start error = %v", err)
+	}
+}
+
+func TestAppStopWithoutStart(t *testing.T) {
+	if err := New().Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
 	}
 }
 
@@ -435,6 +720,19 @@ type mockServletComponent struct {
 	startError  error
 	stopError   error
 	mu          sync.Mutex
+}
+
+type cancelingServletComponent struct {
+	*mockServletComponent
+	cancel context.CancelFunc
+}
+
+func (c *cancelingServletComponent) Start(ctx context.Context) error {
+	if err := c.mockServletComponent.Start(ctx); err != nil {
+		return err
+	}
+	c.cancel()
+	return nil
 }
 
 func newMockServletComponent(prefix string) *mockServletComponent {
@@ -470,12 +768,12 @@ func (c *mockServletComponent) wasStopCalled() bool {
 }
 
 func TestAppServletLifecycle(t *testing.T) {
-	mux := NewMux()
-	app := New(mux, Options{Addr: ":8091"})
+	mux := NewRouter()
+	app := New(Options{Router: mux, Addr: ":8091"})
 
 	// 创建实现了 Servlet 接口的组件
 	servlet := newMockServletComponent("/servlet")
-	servlet.Mux().HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
+	servlet.Router().HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
 
@@ -495,7 +793,7 @@ func TestAppServletLifecycle(t *testing.T) {
 	}
 
 	// 停止服务器应该调用 Servlet.Stop
-	if err := app.Stop(ctx); err != nil {
+	if err := app.Stop(); err != nil {
 		t.Fatalf("Stop failed: %v", err)
 	}
 
@@ -504,9 +802,35 @@ func TestAppServletLifecycle(t *testing.T) {
 	}
 }
 
+func TestAppStartRollsBackWhenContextIsCanceledDuringStartup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	first := &cancelingServletComponent{
+		mockServletComponent: newMockServletComponent("/first"),
+		cancel:               cancel,
+	}
+	second := newMockServletComponent("/second")
+	app := New(Options{Addr: "127.0.0.1:0"})
+	app.Register(first)
+	app.Register(second)
+
+	err := app.Start(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start error = %v, want %v", err, context.Canceled)
+	}
+	if !first.wasStartCalled() {
+		t.Fatal("first Servlet.Start was not called")
+	}
+	if !first.wasStopCalled() {
+		t.Fatal("started Servlet was not stopped during rollback")
+	}
+	if second.wasStartCalled() {
+		t.Fatal("next Servlet.Start ran after startup context cancellation")
+	}
+}
+
 func TestAppServletStartError(t *testing.T) {
-	mux := NewMux()
-	app := New(mux, Options{Addr: ":8092"})
+	mux := NewRouter()
+	app := New(Options{Router: mux, Addr: ":8092"})
 
 	// 创建会在 Start 时返回错误的组件
 	servlet := newMockServletComponent("/servlet")
@@ -519,7 +843,7 @@ func TestAppServletStartError(t *testing.T) {
 	// 启动服务器应该失败
 	err := app.Start(ctx)
 	if err == nil {
-		_ = app.Stop(ctx)
+		_ = app.Stop()
 		t.Fatal("Start should fail when Servlet.Start returns error")
 	}
 
@@ -529,8 +853,8 @@ func TestAppServletStartError(t *testing.T) {
 }
 
 func TestAppMultipleServlets(t *testing.T) {
-	mux := NewMux()
-	app := New(mux, Options{Addr: ":8093"})
+	mux := NewRouter()
+	app := New(Options{Router: mux, Addr: ":8093"})
 
 	// 创建多个 Servlet 组件
 	servlet1 := newMockServletComponent("/servlet1")
@@ -562,7 +886,7 @@ func TestAppMultipleServlets(t *testing.T) {
 	}
 
 	// 停止服务器
-	if err := app.Stop(ctx); err != nil {
+	if err := app.Stop(); err != nil {
 		t.Fatalf("Stop failed: %v", err)
 	}
 
@@ -575,6 +899,29 @@ func TestAppMultipleServlets(t *testing.T) {
 	}
 	if !servlet3.wasStopCalled() {
 		t.Error("servlet3.Stop was not called")
+	}
+}
+
+func TestAppStopJoinsServletErrors(t *testing.T) {
+	app := New(Options{Addr: "127.0.0.1:0"})
+	firstError := errors.New("first stop failed")
+	secondError := errors.New("second stop failed")
+	first := newMockServletComponent("/first")
+	first.stopError = firstError
+	second := newMockServletComponent("/second")
+	second.stopError = secondError
+	app.Register(first)
+	app.Register(second)
+
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	err := app.Stop()
+	if !errors.Is(err, firstError) {
+		t.Errorf("Stop error %v does not contain %v", err, firstError)
+	}
+	if !errors.Is(err, secondError) {
+		t.Errorf("Stop error %v does not contain %v", err, secondError)
 	}
 }
 
@@ -594,8 +941,8 @@ func (s *servletWithOrder) Stop() error {
 }
 
 func TestAppServletStopOrder(t *testing.T) {
-	mux := NewMux()
-	app := New(mux, Options{Addr: ":8094"})
+	mux := NewRouter()
+	app := New(Options{Router: mux, Addr: ":8094"})
 
 	// 记录 Stop 调用顺序
 	var stopOrder []int
@@ -626,7 +973,7 @@ func TestAppServletStopOrder(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	if err := app.Stop(ctx); err != nil {
+	if err := app.Stop(); err != nil {
 		t.Fatalf("Stop failed: %v", err)
 	}
 
@@ -647,18 +994,18 @@ func TestAppServletStopOrder(t *testing.T) {
 }
 
 func TestAppMixedComponents(t *testing.T) {
-	mux := NewMux()
-	app := New(mux, Options{Addr: ":8095"})
+	mux := NewRouter()
+	app := New(Options{Router: mux, Addr: ":8095"})
 
 	// 注册普通组件（不实现 Servlet）
 	normalComponent := NewComponent("/normal")
-	normalComponent.Mux().HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
+	normalComponent.Router().HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("normal"))
 	})
 
 	// 注册 Servlet 组件
 	servlet := newMockServletComponent("/servlet")
-	servlet.Mux().HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
+	servlet.Router().HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("servlet"))
 	})
 
@@ -699,7 +1046,7 @@ func TestAppMixedComponents(t *testing.T) {
 		t.Errorf("servlet component body = %q, want %q", string(body), "servlet")
 	}
 
-	if err := app.Stop(ctx); err != nil {
+	if err := app.Stop(); err != nil {
 		t.Fatalf("Stop failed: %v", err)
 	}
 
@@ -720,8 +1067,8 @@ func (s *servletWithContextCapture) Start(ctx context.Context) error {
 }
 
 func TestAppServletWithContext(t *testing.T) {
-	mux := NewMux()
-	app := New(mux, Options{Addr: ":8096"})
+	mux := NewRouter()
+	app := New(Options{Router: mux, Addr: ":8096"})
 
 	var receivedCtx context.Context
 	servlet := &servletWithContextCapture{
@@ -749,7 +1096,7 @@ func TestAppServletWithContext(t *testing.T) {
 		t.Error("Servlet.Start received wrong context")
 	}
 
-	err := app.Stop(ctx)
+	err := app.Stop()
 	if err != nil {
 		t.Fatalf("Stop failed: %v", err)
 	}

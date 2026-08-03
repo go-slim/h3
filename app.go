@@ -19,15 +19,25 @@ type Options struct {
 	// App.Start 会在启动 HTTP 服务前调用 Router.Build。
 	Router *Router
 
+	// NotFound 在 http.ServeMux 没有找到匹配路由时处理请求。
+	// nil 时保留标准库的 404 状态、响应头和文本响应体。
+	// 应用可在此写入 JSON 或其他响应格式，h3 不规定错误数据结构。
+	NotFound http.Handler
+
+	// MethodNotAllowed 在路径匹配但请求方法不匹配时处理请求。
+	// nil 时保留标准库的 405 响应。调用自定义 Handler 前，h3
+	// 会将 http.ServeMux 计算的 Allow 响应头传递给它。
+	MethodNotAllowed http.Handler
+
 	// Addr 可选地指定应用监听的 TCP 地址，格式为 "host:port"。
 	// 如果为空，使用 ":http"（端口 80）。
 	// 服务名称在 RFC 6335 中定义并由 IANA 分配。
 	// 地址格式的详细信息请参见 net.Dial。
 	Addr string
 
-	// DisableGeneralOptionsHandler 如果为 true，将 "OPTIONS *" 请求传递给 Handler，
-	// 否则响应 200 OK 和 Content-Length: 0。
-	DisableGeneralOptionsHandler bool
+	// PassOptionsStar 如果为 true，将 "OPTIONS *" 请求传递给应用 Handler。
+	// 否则由 net/http 直接响应 200 OK 和 Content-Length: 0。
+	PassOptionsStar bool
 
 	// TLSConfig 非 nil 时启用 TLS，并将配置交给 http.Server.ServeTLS。
 	// 配置必须通过 Certificates、GetCertificate 或 GetConfigForClient 提供
@@ -126,6 +136,7 @@ var _ Servlet = (*App)(nil)
 type App struct {
 	options  *Options        // 应用配置参数
 	router   *Router         // 路由复用器
+	handler  http.Handler    // 根据路由错误配置预先选定的请求入口
 	servlets []Servlet       // 服务组件列表
 	stop     chan chan error // 当前运行周期的停止请求；未运行时为 nil
 }
@@ -163,6 +174,7 @@ func New(options ...Options) *App {
 	return &App{
 		options: &opts,
 		router:  router,
+		handler: newFallbackHandler(router, opts.NotFound, opts.MethodNotAllowed),
 	}
 }
 
@@ -248,7 +260,7 @@ func (a *App) Handler(r *http.Request) (h http.Handler, pattern string) {
 //   - w: HTTP 响应写入器
 //   - r: HTTP 请求
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	a.router.ServeHTTP(NewResponse(w), r)
+	a.handler.ServeHTTP(NewResponse(w), r)
 }
 
 // Start 启动 HTTP 应用（非阻塞）。
@@ -360,7 +372,7 @@ func (a *App) Start(ctx context.Context) error {
 	server := &http.Server{
 		Addr:                         addr,
 		Handler:                      a,
-		DisableGeneralOptionsHandler: opts.DisableGeneralOptionsHandler,
+		DisableGeneralOptionsHandler: opts.PassOptionsStar,
 		TLSConfig:                    opts.TLSConfig,
 		ReadTimeout:                  opts.ReadTimeout,
 		ReadHeaderTimeout:            opts.ReadHeaderTimeout,

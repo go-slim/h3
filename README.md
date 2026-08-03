@@ -198,6 +198,44 @@ with another facility compatible with `http.ServeMux`. Result order is
 undefined because declarations are stored in maps. Most applications should
 simply call `Build`.
 
+### 404 and 405 responses
+
+A standalone `Router` retains the default text responses from
+`http.ServeMux`. When serving through `App`, use `Options.NotFound` and
+`Options.MethodNotAllowed` to provide JSON or another application protocol:
+
+```go
+func jsonError(status int, code string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":   false,
+			"code": code,
+		})
+	})
+}
+
+app := h3.New(h3.Options{
+	Router:           router,
+	NotFound:         jsonError(http.StatusNotFound, "NotFound"),
+	MethodNotAllowed: jsonError(http.StatusMethodNotAllowed, "MethodNotAllowed"),
+})
+```
+
+`http.ServeMux` still decides whether a request is a 404 or 405; h3 does not
+reimplement host, wildcard, or GET/HEAD matching. A custom 405 handler receives
+the `Allow` header calculated by ServeMux. Only routing-layer 404/405 responses
+are replaced: a matched handler that deliberately writes either status is left
+unchanged. A nil handler preserves the standard-library response. When both
+handlers are nil, App selects Router directly during `New`, so requests do not
+create the additional route-error response wrapper.
+
+Route-error handlers live at the App boundary and do not belong to a registered
+Route, so `Router.Use` middleware is not applied to them automatically. Wrap
+these handlers with the same standard middleware when route misses also need
+logging or tracing.
+
 ## App lifecycle
 
 `App` combines a Router, `http.Server`, and Servlets, and itself implements
@@ -379,6 +417,9 @@ content concurrently should aggregate or synchronize before writing.
 `Options` maps supported `http.Server` settings, including the listen address,
 read/write/idle timeouts, TLS, connection-state hooks, serving completion,
 error logging, HTTP/2 configuration, and protocols.
+When `PassOptionsStar` is true, the special `OPTIONS *` request is passed to
+the application Handler; by default `net/http` answers it directly. This does
+not affect OPTIONS routes for ordinary paths.
 
 ```go
 app := h3.New(h3.Options{

@@ -177,6 +177,42 @@ router.Use(requestLog)
 路由声明注册到其他兼容 `http.ServeMux` 的设施中。结果顺序未定义，调用方不应依赖
 映射遍历顺序。通常直接调用 `Build` 即可。
 
+### 404 与 405 响应
+
+`Router` 单独使用时保留 `http.ServeMux` 的默认文本响应。通过 `App`
+服务时，可以用 `Options.NotFound` 和 `Options.MethodNotAllowed` 替换为
+JSON 或其他应用协议：
+
+```go
+func jsonError(status int, code string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":   false,
+			"code": code,
+		})
+	})
+}
+
+app := h3.New(h3.Options{
+	Router:           router,
+	NotFound:         jsonError(http.StatusNotFound, "NotFound"),
+	MethodNotAllowed: jsonError(http.StatusMethodNotAllowed, "MethodNotAllowed"),
+})
+```
+
+h3 仍由 `http.ServeMux` 判断 404 和 405，不重新实现 host、通配符、
+GET/HEAD 等匹配规则。405 Handler 能够读取 ServeMux 计算的 `Allow`
+响应头。仅路由层生成的 404/405 会被替换；已匹配 Handler 自己写入
+的 404/405 保持不变。nil Handler 保留标准库默认响应。
+两个 Handler 均为 nil 时，App 在 `New` 期间直接选用 Router，请求路径
+不会创建额外的路由错误响应包装。
+
+路由错误 Handler 位于 App 边界，不属于任何已注册 Route，因此不会
+自动经过 `Router.Use` 中间件。需要为路由错误记录日志或 tracing 时，
+可用同一个标准库中间件包装这两个 Handler。
+
 ## App 生命周期
 
 `App` 组合 Router、`http.Server` 和 Servlet，并且自身也实现 `Servlet`。
@@ -332,6 +368,8 @@ Response 与标准 `http.ResponseWriter` 一样不支持无协调的并发写入
 
 `Options` 映射 h3 支持的 `http.Server` 配置，包括监听地址、读/写/空闲超时、TLS、
 连接状态回调、Serve 完成回调、错误日志、HTTP/2 配置与协议集。
+`PassOptionsStar` 为 true 时会将特殊的 `OPTIONS *` 请求传递给应用
+Handler；默认由 `net/http` 直接响应。该选项不影响普通路径的 OPTIONS 路由。
 
 ```go
 app := h3.New(h3.Options{

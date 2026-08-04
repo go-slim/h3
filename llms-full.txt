@@ -34,11 +34,12 @@ h3 does not add a custom request Context, error-returning handler type, binder, 
 | Run an HTTP/HTTPS application | `New`, `App.Start`, `App.Stop` |
 | Use a blocking development entry point | `Run` |
 | Register a modular route group | `Component`, `NewComponent`, `App.Register` |
-| Start and stop component resources | `Servlet` |
+| Register lifecycle without routes | `Servlet`, `App.RegisterServlet` |
+| Combine routes and lifecycle in one owner | Implement both `Component` and `Servlet`, then call `App.Register` |
 | Customize routing-layer 404/405 | `Options.NotFound`, `Options.MethodNotAllowed` |
 | Observe final response metadata | `Response`, `NewResponse` |
 
-Use a standalone Router when another system already owns the HTTP server. Use App when h3 should own the listener and component lifecycle.
+Use a standalone Router when another system already owns the HTTP server. Use App when h3 should own the listener and ordered resource lifecycle.
 
 ## Installation
 
@@ -96,6 +97,7 @@ type App struct { /* unexported lifecycle state */ }
 func New(options ...Options) *App
 func (a *App) Use(middleware func(http.Handler) http.Handler)
 func (a *App) Register(component Component)
+func (a *App) RegisterServlet(servlet Servlet)
 func (a *App) Handle(pattern string, handler http.Handler)
 func (a *App) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request))
 func (a *App) Handler(req *http.Request) (http.Handler, string)
@@ -349,7 +351,7 @@ Options maps the following values to `http.Server`:
 
 | h3 option | Meaning |
 | --- | --- |
-| `Addr` | TCP listen address; empty uses `:http` |
+| `Addr` | TCP listen address; empty uses `:http` without TLS and `:https` with TLS |
 | `PassOptionsStar` | true passes special `OPTIONS *` to App; false lets net/http answer it |
 | `TLSConfig` | non-nil enables `ServeTLS` |
 | `ReadTimeout` | maximum duration for reading the full request |
@@ -415,9 +417,9 @@ Servlet Start and Stop panics are converted to errors at the App lifecycle bound
 
 App lifecycle is intentionally sequential and lock-free:
 
-- one application control flow must own Start, Stop, Register, Run, and lifecycle-related configuration;
+- one application control flow must own Start, Stop, Register, RegisterServlet, Run, and lifecycle-related configuration;
 - do not call Start and Stop concurrently;
-- do not call Register while App is running;
+- do not call Register or RegisterServlet while App is running;
 - Start while running returns an error;
 - Stop while stopped returns nil;
 - after Stop completes, the same App may be started again.
@@ -515,7 +517,7 @@ component.Router().HandleFunc("GET /{id}", getUser)
 app.Register(component)
 ```
 
-Register mounts the Component Router under its normalized prefix. A Component that also implements Servlet is added to App's lifecycle list.
+Register mounts the Component Router under its normalized prefix. A Component that also implements Servlet is added to App's lifecycle list. Do not pass that same value to RegisterServlet as well, or its lifecycle will be enrolled twice.
 
 Register panics when:
 
@@ -552,9 +554,13 @@ type Servlet interface {
 
 Typical Servlet resources include database pools, message-queue clients, caches, scheduled jobs, and background workers.
 
+Use `App.RegisterServlet(servlet)` when such a resource owns no routes. It joins the same lifecycle sequence as Servlets enrolled through `App.Register(component)`, without requiring an empty Component. Registrations from both methods start in their combined registration order and stop in reverse order.
+
+`RegisterServlet` panics when the Servlet is nil or the App is running.
+
 App semantics:
 
-- Start methods run in component registration order before HTTP serving begins.
+- Start methods run in the combined `Register`/`RegisterServlet` order before HTTP serving begins.
 - Stop methods run in reverse registration order after HTTP serving ends.
 - each successfully started Servlet receives one Stop call from App for that cycle;
 - a failed or cancelled startup rolls back only the successfully started prefix;
@@ -655,7 +661,7 @@ Before listening, h3 requires at least one TLS certificate source:
 
 This validation checks only that a source exists. Whether a dynamic callback returns a usable certificate for a particular handshake remains the responsibility of `crypto/tls`.
 
-ServeTLS clones TLSConfig according to standard-library semantics. An empty Addr remains `:http`, so TLS applications normally choose an explicit HTTPS port.
+ServeTLS clones TLSConfig according to standard-library semantics. With an empty Addr, plain HTTP uses `:http` (port 80) and a non-nil TLSConfig selects `:https` (port 443). An explicit Addr always wins, so TLS applications can still select ports such as `:8443`.
 
 ## Error and panic boundaries
 
@@ -670,6 +676,7 @@ h3 distinguishes runtime failures from programmer configuration errors:
 | Invalid or conflicting ServeMux pattern | panic during Build |
 | Empty mount prefix, nil child, or mount cycle | panic during Mount |
 | Nil, duplicate, or runtime Component registration | panic during Register |
+| Nil or runtime standalone Servlet registration | panic during RegisterServlet |
 | Invalid address, listen failure, invalid TLS setup | error from Start |
 | Startup Context cancellation | error from Start, with rollback |
 | Servlet Start error or panic | error from Start, with rollback |
@@ -754,18 +761,20 @@ These omissions keep h3 compatible with the standard library and allow applicati
 4. **Using `http.StripPrefix` assumptions:** h3 expands mounted patterns and preserves the original request URL.
 5. **Treating `GET api/users` as a path:** according to ServeMux grammar, `api` is the host; write `GET /api/users` for a path.
 6. **Cancelling the startup Context to stop App:** cancellation after successful Start has no runtime effect; call Stop.
-7. **Running lifecycle methods concurrently:** App and Router configuration rely on a single control-plane writer.
+7. **Running lifecycle methods concurrently:** App and Router configuration rely on a single control-plane writer; this includes RegisterServlet.
 8. **Expecting Stop to wait for OnStopped:** Stop returns after resource cleanup and before callback completion; use Run or explicit synchronization.
 9. **Expecting Router middleware on fallback handlers:** NotFound and MethodNotAllowed sit outside registered routes.
 10. **Writing a fallback body without status:** normal net/http rules produce 200 unless the fallback calls WriteHeader.
 11. **Using standalone Router and expecting h3.Response:** App wraps writers; Router does not.
 12. **Writing through Unwrap and expecting metadata:** bypassed writes are not recorded.
 13. **Treating implemented optional interfaces as guaranteed support:** Flush, Hijack, and Push still depend on the underlying writer.
+14. **Creating an empty Component for a resource with no routes:** implement Servlet and call RegisterServlet directly.
+15. **Assuming TLS with an empty Addr still uses port 80:** TLSConfig changes the protocol default to `:https` (port 443).
 
 ## Source map
 
 - `router.go`: Router declarations, duplicate policy, mount expansion, middleware composition, CompileRoutes, Build, and atomic publication.
-- `app.go`: Options, App routing methods, Component registration, listener setup, HTTP/HTTPS serving, startup rollback, shutdown, and OnStopped.
+- `app.go`: Options, App routing methods, Component and standalone Servlet registration, listener setup, HTTP/HTTPS serving, startup rollback, shutdown, and OnStopped.
 - `route_fallback.go`: optional routing-layer 404/405 interception and default-response preservation.
 - `response.go`: Response metadata and optional ResponseWriter capabilities.
 - `component.go`: Component and NewComponent.
@@ -775,7 +784,7 @@ These omissions keep h3 compatible with the standard library and allow applicati
 ## Test map
 
 - `router_test.go`: standard route matching, path values, wildcards, middleware order, rebuilding, atomic replacement, host-aware mounts, duplicate replacement, invalid middleware, nil/cycle mounts, nested mounts, and standalone writer behavior.
-- `app_test.go`: App writer wrapping, middleware, components, duplicate ownership, listener errors, TLS, startup Context behavior, restart, graceful shutdown, Servlet errors, rollback, error joining, and reverse stop order.
+- `app_test.go`: App writer wrapping, middleware, Components, standalone Servlets, duplicate ownership, default HTTP/HTTPS addresses, listener errors, TLS, startup Context behavior, restart, graceful shutdown, Servlet errors, rollback, error joining, and reverse stop order.
 - `route_fallback_test.go`: default/custom 404 and 405, `Allow`, matched-route status preservation, and ServeMux redirects.
 - `response_test.go`: initial/final metadata, multiple writes, duplicate WriteHeader, idempotent wrapping, Flush, Hijack, Push, and unsupported capabilities.
 - `component_test.go`: basic components, route mounting, middleware, and multiple modules.

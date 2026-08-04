@@ -81,11 +81,10 @@ func TestRunReturnsStopError(t *testing.T) {
 	addr := runTestAddress(t)
 	stopErr := errors.New("stop failed")
 	servlet := &runTestServlet{
-		Component: NewComponent("/servlet"),
-		stopErr:   stopErr,
+		stopErr: stopErr,
 	}
 	app := New(Options{Addr: addr})
-	app.Register(servlet)
+	app.RegisterServlet(servlet)
 
 	done := make(chan error, 1)
 	go func() {
@@ -107,7 +106,6 @@ func TestRunReturnsStopError(t *testing.T) {
 }
 
 type runTestServlet struct {
-	Component
 	stopErr error
 }
 

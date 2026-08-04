@@ -1,10 +1,10 @@
 # go-slim.dev/h3
 
-> A small, standard-library-first Go HTTP application foundation with declarative routing, middleware composition, component lifecycle management, HTTP/HTTPS startup, custom routing fallbacks, and response metadata.
+> A small, standard-library-first Go HTTP application foundation with declarative routing, middleware composition, ordered resource lifecycle, HTTP/HTTPS startup, custom routing fallbacks, and response metadata.
 
 Import path: `go-slim.dev/h3`. Requires Go 1.25.5 or later. Runtime code depends only on the Go standard library.
 
-Use `Router` to declare routes, middleware, and mounted sub-routers. Call `Router.Build` to atomically publish an immutable `http.ServeMux` snapshot, or use `App`, whose `Start` method builds the root Router automatically. Use `Component` and `Servlet` for modular routes and ordered resource lifecycle. Use `NewResponse` only when final response status, size, or commit metadata is needed outside App.
+Use `Router` to declare routes, middleware, and mounted sub-routers. Call `Router.Build` to atomically publish an immutable `http.ServeMux` snapshot, or use `App`, whose `Start` method builds the root Router automatically. Register route modules with `App.Register(Component)`. Register resources that have lifecycle but no routes with `App.RegisterServlet(Servlet)`; a Component that also implements Servlet is enrolled automatically by `Register`. Use `NewResponse` only when final response status, size, or commit metadata is needed outside App.
 
 Important behavior:
 
@@ -13,8 +13,10 @@ Important behavior:
 - `Use`, `Handle`, `HandleFunc`, and `Mount` only change declarations. Changes become visible after the next `Build`.
 - Mounted routes are expanded at build time, so handlers keep the original URL and `Request.Pattern` contains every mount prefix.
 - Middleware factories run during `Build` or `CompileRoutes`, once per final route per compilation, never during request dispatch.
-- App lifecycle operations are sequential and lock-free. Do not call `Start`, `Stop`, `Register`, or `Run` concurrently.
+- App lifecycle operations are sequential and lock-free. Do not call `Start`, `Stop`, `Register`, `RegisterServlet`, or `Run` concurrently.
+- Do not pass a Component that already implements Servlet to both `Register` and `RegisterServlet`; that would enroll its lifecycle twice.
 - The Context passed to `Start` controls startup and rollback. Cancelling it after a successful start does not stop the running App; call `Stop` explicitly.
+- With an empty `Options.Addr`, plain HTTP listens on `:http` (port 80) and a non-nil `TLSConfig` selects `:https` (port 443). An explicit address always wins.
 - `Options.NotFound` and `Options.MethodNotAllowed` replace only routing-layer 404/405 responses. A matched handler's own 404/405 response is unchanged, and custom 405 handlers receive the standard `Allow` header.
 - App wraps writers as `h3.Response`; standalone Router does not. Response records one final status and body size, not interim 1xx responses or writes performed through `Unwrap`.
 - h3 intentionally does not provide binding, rendering, validation, content negotiation, tracing, a custom request Context, or a central error pipeline.
@@ -29,7 +31,7 @@ Important behavior:
 ## Source
 
 - [Router](https://github.com/go-slim/h3/blob/main/router.go): Route declarations, middleware, mounts, pattern expansion, compilation, atomic publication, and duplicate policy.
-- [App](https://github.com/go-slim/h3/blob/main/app.go): Server options, route entry point, components, listener creation, HTTP/HTTPS serving, startup rollback, and shutdown.
+- [App](https://github.com/go-slim/h3/blob/main/app.go): Server options, route entry point, Component and standalone Servlet registration, listener creation, HTTP/HTTPS serving, startup rollback, and shutdown.
 - [Route fallbacks](https://github.com/go-slim/h3/blob/main/route_fallback.go): Optional routing-layer 404/405 replacement while preserving `http.ServeMux` matching and `Allow`.
 - [Response](https://github.com/go-slim/h3/blob/main/response.go): Final status, body size, commit tracking, unwrapping, flush, hijack, and push delegation.
 - [Component](https://github.com/go-slim/h3/blob/main/component.go): Mountable route modules.
@@ -39,7 +41,7 @@ Important behavior:
 ## Tests
 
 - [Router tests](https://github.com/go-slim/h3/blob/main/router_test.go): Build publication, middleware order, duplicate replacement, host patterns, mounts, cycles, and standard routing behavior.
-- [App tests](https://github.com/go-slim/h3/blob/main/app_test.go): Listener errors, TLS, restart, Context semantics, components, lifecycle rollback, stop order, and callbacks.
+- [App tests](https://github.com/go-slim/h3/blob/main/app_test.go): Default HTTP/HTTPS addresses, listener errors, TLS, restart, Context semantics, Components, standalone Servlets, lifecycle rollback, stop order, and callbacks.
 - [Fallback tests](https://github.com/go-slim/h3/blob/main/route_fallback_test.go): Custom/default 404 and 405 behavior, `Allow`, matched-route status preservation, and redirects.
 - [Response tests](https://github.com/go-slim/h3/blob/main/response_test.go): Metadata, idempotent wrapping, optional interfaces, and unsupported operations.
 - [Run tests](https://github.com/go-slim/h3/blob/main/util_test.go): Blocking completion, callback preservation, and final error propagation.

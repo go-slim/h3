@@ -302,6 +302,43 @@ app.Register(newWorkerComponent())
 应嵌入 `h3.Component`，而不是 `*h3.Component`：`Component` 是接口，
 `NewComponent` 返回该接口的实现。
 
+如果资源只有生命周期而没有路由，直接使用 `RegisterServlet`，不需要创建空的
+Component：
+
+```go
+type databaseServlet struct {
+	db *sql.DB
+}
+
+func (s *databaseServlet) Start(ctx context.Context) error {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return err
+	}
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return err
+	}
+	s.db = db
+	return nil
+}
+
+func (s *databaseServlet) Stop() error {
+	if s.db == nil {
+		return nil
+	}
+	err := s.db.Close()
+	s.db = nil
+	return err
+}
+
+app.RegisterServlet(&databaseServlet{})
+```
+
+`Register` 自动注册同时实现 `Servlet` 的 Component；不要再把同一对象传给
+`RegisterServlet`，否则其生命周期会被登记两次。所有 Servlet 按登记顺序启动，
+并按相反顺序停止。
+
 ## TLS
 
 `Options.TLSConfig` 非 nil 时，App 使用 `http.Server.ServeTLS` 提供 HTTPS。配置必须
@@ -323,7 +360,8 @@ app := h3.New(h3.Options{
 })
 ```
 
-`Addr` 为空时仍使用 `:http`；启用 TLS 时通常应显式设置 HTTPS 监听地址。
+`Addr` 为空时，普通 HTTP 使用 `:http`（端口 80），启用 TLS 后使用
+`:https`（端口 443）。显式设置的地址始终优先，因此仍可使用 `:8443` 等端口。
 
 ## Response
 

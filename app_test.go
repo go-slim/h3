@@ -31,6 +31,45 @@ func TestNew(t *testing.T) {
 	}
 }
 
+func TestListenAddress(t *testing.T) {
+	tests := []struct {
+		name    string
+		options Options
+		want    string
+	}{
+		{
+			name: "default HTTP",
+			want: ":http",
+		},
+		{
+			name:    "default HTTPS",
+			options: Options{TLSConfig: &tls.Config{}},
+			want:    ":https",
+		},
+		{
+			name:    "explicit HTTP address",
+			options: Options{Addr: "127.0.0.1:8080"},
+			want:    "127.0.0.1:8080",
+		},
+		{
+			name: "explicit TLS address",
+			options: Options{
+				Addr:      "127.0.0.1:8443",
+				TLSConfig: &tls.Config{},
+			},
+			want: "127.0.0.1:8443",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := listenAddress(&tt.options); got != tt.want {
+				t.Fatalf("listenAddress() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAppWrapsResponseWriter(t *testing.T) {
 	router := NewRouter()
 	router.HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
@@ -157,6 +196,54 @@ func TestAppRegisterRejectsAmbiguousLifecycleOwnership(t *testing.T) {
 			}
 		}()
 		app.Register(NewComponent("/api"))
+	})
+}
+
+func TestAppRegisterServlet(t *testing.T) {
+	addr := unusedTestAddress(t)
+	app := New(Options{Addr: addr})
+	servlet := newMockServlet()
+
+	app.RegisterServlet(servlet)
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if !servlet.wasStartCalled() {
+		t.Fatal("Servlet.Start was not called")
+	}
+
+	if err := app.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if !servlet.wasStopCalled() {
+		t.Fatal("Servlet.Stop was not called")
+	}
+}
+
+func TestAppRegisterServletRejectsInvalidRegistration(t *testing.T) {
+	t.Run("nil servlet", func(t *testing.T) {
+		app := New()
+		defer func() {
+			if recovered := recover(); recovered != "h3: nil servlet" {
+				t.Fatalf("RegisterServlet panic = %v, want h3: nil servlet", recovered)
+			}
+		}()
+		app.RegisterServlet(nil)
+	})
+
+	t.Run("started app", func(t *testing.T) {
+		app := New(Options{Addr: "127.0.0.1:0"})
+		if err := app.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer func() { _ = app.Stop() }()
+
+		defer func() {
+			if recovered := recover(); recovered != "h3: cannot register servlet while app is started" {
+				t.Fatalf("RegisterServlet panic = %v, want started-app panic", recovered)
+			}
+		}()
+		app.RegisterServlet(newMockServlet())
 	})
 }
 

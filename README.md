@@ -341,6 +341,44 @@ app.Register(newWorkerComponent())
 Embed `h3.Component`, not `*h3.Component`: `Component` is an interface and
 `NewComponent` returns an implementation of it.
 
+When a resource has lifecycle but no routes, register it directly with
+`RegisterServlet`; it does not need an empty Component:
+
+```go
+type databaseServlet struct {
+	db *sql.DB
+}
+
+func (s *databaseServlet) Start(ctx context.Context) error {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return err
+	}
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return err
+	}
+	s.db = db
+	return nil
+}
+
+func (s *databaseServlet) Stop() error {
+	if s.db == nil {
+		return nil
+	}
+	err := s.db.Close()
+	s.db = nil
+	return err
+}
+
+app.RegisterServlet(&databaseServlet{})
+```
+
+`Register` automatically enrolls a Component that also implements `Servlet`.
+Do not pass the same object to `RegisterServlet` as well, or its lifecycle will
+be enrolled twice. All Servlets start in registration order and stop in reverse
+order.
+
 ## TLS
 
 A non-nil `Options.TLSConfig` makes App serve HTTPS with
@@ -363,8 +401,9 @@ app := h3.New(h3.Options{
 })
 ```
 
-An empty `Addr` still uses `:http`; applications enabling TLS will usually set
-an explicit HTTPS address.
+With an empty `Addr`, plain HTTP uses `:http` (port 80) and TLS uses `:https`
+(port 443). An explicit address always wins, so ports such as `:8443` remain
+available.
 
 ## Response
 

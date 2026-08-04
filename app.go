@@ -1,7 +1,6 @@
 package h3
 
 import (
-	"cmp"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -30,7 +29,8 @@ type Options struct {
 	MethodNotAllowed http.Handler
 
 	// Addr 可选地指定应用监听的 TCP 地址，格式为 "host:port"。
-	// 如果为空，使用 ":http"（端口 80）。
+	// 如果为空，普通 HTTP 使用 ":http"（端口 80），TLSConfig 非 nil 时
+	// 使用 ":https"（端口 443）。显式地址始终优先于协议默认值。
 	// 服务名称在 RFC 6335 中定义并由 IANA 分配。
 	// 地址格式的详细信息请参见 net.Dial。
 	Addr string
@@ -220,6 +220,27 @@ func (a *App) Register(c Component) {
 	}
 }
 
+// RegisterServlet 注册一个不拥有路由的服务组件。
+//
+// Servlet 会按照注册顺序启动，并按照注册顺序的逆序停止。数据库连接、
+// 消息消费者和后台 worker 等只拥有生命周期的资源可以使用此方法，而不必
+// 为注册到 App 而实现一个空 Component。
+//
+// 同时拥有路由和生命周期的组件应继续使用 [App.Register]，该方法会挂载
+// Component，并自动将其作为 Servlet 加入同一生命周期序列。不要再对同一个
+// 对象调用 RegisterServlet，否则其生命周期会被注册两次。
+//
+// RegisterServlet 必须在 App 未运行时调用。nil Servlet 会 panic。
+func (a *App) RegisterServlet(servlet Servlet) {
+	if servlet == nil {
+		panic("h3: nil servlet")
+	}
+	if a.stop != nil {
+		panic("h3: cannot register servlet while app is started")
+	}
+	a.servlets = append(a.servlets, servlet)
+}
+
 // Handle 注册路由模式和对应的处理器
 //
 // 此方法委托给内部路由器，将指定的处理器绑定到路由模式。
@@ -299,7 +320,7 @@ func (a *App) Start(ctx context.Context) error {
 	}
 
 	// 验证监听地址格式
-	addr := cmp.Or(opts.Addr, ":http")
+	addr := listenAddress(opts)
 	if _, _, err := net.SplitHostPort(addr); err != nil {
 		return err
 	}
@@ -457,6 +478,16 @@ func (a *App) Start(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+func listenAddress(options *Options) string {
+	if options.Addr != "" {
+		return options.Addr
+	}
+	if options.TLSConfig != nil {
+		return ":https"
+	}
+	return ":http"
 }
 
 // Stop 优雅停止 HTTP 应用

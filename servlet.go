@@ -30,26 +30,33 @@ import "context"
 //
 // 示例:
 //
-//	type DatabaseComponent struct {
-//		h3.Component
+//	type DatabaseServlet struct {
 //		db *sql.DB
 //	}
 //
-//	func (c *DatabaseComponent) Start(ctx context.Context) error {
+//	func (s *DatabaseServlet) Start(ctx context.Context) error {
 //		db, err := sql.Open("postgres", "connection-string")
 //		if err != nil {
 //			return err
 //		}
-//		c.db = db
-//		return db.PingContext(ctx)
-//	}
-//
-//	func (c *DatabaseComponent) Stop() error {
-//		if c.db != nil {
-//			return c.db.Close()
+//		if err := db.PingContext(ctx); err != nil {
+//			_ = db.Close()
+//			return err
 //		}
+//		s.db = db
 //		return nil
 //	}
+//
+//	func (s *DatabaseServlet) Stop() error {
+//		if s.db == nil {
+//			return nil
+//		}
+//		db := s.db
+//		s.db = nil
+//		return db.Close()
+//	}
+//
+//	app.RegisterServlet(&DatabaseServlet{})
 type Servlet interface {
 	// Start 启动服务组件
 	//

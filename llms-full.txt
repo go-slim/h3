@@ -1,0 +1,791 @@
+# go-slim.dev/h3
+
+> Complete LLM-oriented reference for a standard-library-first Go HTTP application foundation with declarative routing, middleware, lifecycle management, HTTP/HTTPS serving, routing fallbacks, and response metadata.
+
+## Project identity
+
+- Module and import path: `go-slim.dev/h3`
+- Package name: `h3`
+- Repository: `https://github.com/go-slim/h3`
+- Required Go version: 1.25.5 or later
+- Runtime dependencies outside the Go standard library: none
+- License: MIT; see `LICENSE`
+
+h3 builds directly on `net/http`. Requests remain `*http.Request`, handlers remain `http.Handler`, middleware remains `func(http.Handler) http.Handler`, route patterns retain `http.ServeMux` grammar, and request-scoped state belongs in `r.Context()`.
+
+h3 adds five focused capabilities:
+
+1. `Router` records a route tree and atomically publishes compiled `http.ServeMux` snapshots.
+2. Router middleware is composed before requests are served.
+3. `Component` groups a mount prefix and child Router.
+4. `App` owns HTTP/HTTPS startup, graceful shutdown, and `Servlet` lifecycle.
+5. `Response` records final response status, body size, and commit state.
+
+h3 does not add a custom request Context, error-returning handler type, binder, renderer, validator, content negotiator, tracing system, or central error pipeline.
+
+## Selection guide
+
+| Need | API |
+| --- | --- |
+| Declare routes and middleware | `NewRouter`, `Router.Handle`, `Router.HandleFunc`, `Router.Use` |
+| Group routes under a path | `Router.Mount` |
+| Publish Router declarations | `Router.Build` |
+| Inspect fully expanded declarations | `Router.CompileRoutes` |
+| Run an HTTP/HTTPS application | `New`, `App.Start`, `App.Stop` |
+| Use a blocking development entry point | `Run` |
+| Register a modular route group | `Component`, `NewComponent`, `App.Register` |
+| Start and stop component resources | `Servlet` |
+| Customize routing-layer 404/405 | `Options.NotFound`, `Options.MethodNotAllowed` |
+| Observe final response metadata | `Response`, `NewResponse` |
+
+Use a standalone Router when another system already owns the HTTP server. Use App when h3 should own the listener and component lifecycle.
+
+## Installation
+
+```sh
+go get go-slim.dev/h3
+```
+
+## Public API summary
+
+```go
+package h3
+
+type Router struct { /* unexported configuration and atomic ServeMux */ }
+
+func NewRouter() *Router
+func (r *Router) Use(middleware func(http.Handler) http.Handler)
+func (r *Router) Handle(pattern string, handler http.Handler)
+func (r *Router) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request))
+func (r *Router) Mount(prefix string, child *Router)
+func (r *Router) Handler(req *http.Request) (http.Handler, string)
+func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request)
+func (r *Router) CompileRoutes() []Route
+func (r *Router) Build()
+
+type Route struct {
+    Pattern string
+    Handler http.Handler
+}
+
+type Options struct {
+    Router           *Router
+    NotFound         http.Handler
+    MethodNotAllowed http.Handler
+
+    Addr            string
+    PassOptionsStar bool
+    TLSConfig       *tls.Config
+
+    ReadTimeout       time.Duration
+    ReadHeaderTimeout time.Duration
+    WriteTimeout      time.Duration
+    IdleTimeout       time.Duration
+    MaxHeaderBytes    int
+
+    TLSNextProto map[string]func(*http.Server, *tls.Conn, http.Handler)
+    ConnState    func(net.Conn, http.ConnState)
+    ErrorLog     *log.Logger
+    OnStopped    func(manual bool, err error)
+    HTTP2        *http.HTTP2Config
+    Protocols    *http.Protocols
+}
+
+type App struct { /* unexported lifecycle state */ }
+
+func New(options ...Options) *App
+func (a *App) Use(middleware func(http.Handler) http.Handler)
+func (a *App) Register(component Component)
+func (a *App) Handle(pattern string, handler http.Handler)
+func (a *App) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request))
+func (a *App) Handler(req *http.Request) (http.Handler, string)
+func (a *App) ServeHTTP(w http.ResponseWriter, req *http.Request)
+func (a *App) Start(ctx context.Context) error
+func (a *App) Stop() error
+
+func Run(ctx context.Context, app *App) error
+
+type Component interface {
+    Prefix() string
+    Router() *Router
+}
+
+func NewComponent(prefix string) Component
+
+type Servlet interface {
+    Start(ctx context.Context) error
+    Stop() error
+}
+
+type Response interface {
+    http.ResponseWriter
+    http.Flusher
+    http.Hijacker
+    http.Pusher
+
+    Status() int
+    Size() int64
+    Committed() bool
+    Unwrap() http.ResponseWriter
+}
+
+func NewResponse(w http.ResponseWriter) Response
+```
+
+`New` accepts a variadic option only for call-site convenience and uses at most the first `Options` value. It copies that value. If `Options.Router` is nil, New creates an empty Router.
+
+## Minimal application
+
+`App.Start` is non-blocking. Application code must keep the process alive and call `Stop`, or use the blocking `Run` helper.
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "syscall"
+
+    "go-slim.dev/h3"
+)
+
+func main() {
+    app := h3.New(h3.Options{Addr: ":8080"})
+    app.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+        _, _ = w.Write([]byte("user=" + r.PathValue("id")))
+    })
+
+    if err := app.Start(context.Background()); err != nil {
+        log.Fatal(err)
+    }
+
+    signals := make(chan os.Signal, 1)
+    signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+    <-signals
+
+    if err := app.Stop(); err != nil {
+        log.Fatal(err)
+    }
+}
+```
+
+For a blocking development entry point:
+
+```go
+if err := h3.Run(context.Background(), app); err != nil {
+    log.Fatal(err)
+}
+```
+
+`Run` does not stop the App when its Context is cancelled after startup. A signal handler or another owner must still call `app.Stop()`.
+
+## Router model
+
+### Declarations and publication
+
+`Use`, `Handle`, `HandleFunc`, and `Mount` modify declarations only. `Build` compiles the complete tree into a new `http.ServeMux` and publishes it through an atomic pointer.
+
+```go
+router := h3.NewRouter()
+router.HandleFunc("GET /users", listUsers)
+router.HandleFunc("GET /users/{id}", getUser)
+router.HandleFunc("POST /users", createUser)
+router.HandleFunc("GET /files/{path...}", serveFile)
+router.Build()
+```
+
+Before the first Build, Router behaves like an empty `http.ServeMux` and returns the standard 404 response. After configuration changes, the previous routing table remains active until another successful Build.
+
+Build constructs the replacement before publishing it. A panic caused by an invalid or conflicting pattern does not replace an already published routing table. Requests that selected an older snapshot continue on that snapshot; later requests use the newly published one.
+
+`Router.Handler` looks up a request in the currently published snapshot and returns the already composed handler and matched pattern. It does not inspect unbuilt declarations.
+
+### Route-pattern semantics
+
+Patterns use the standard library grammar introduced in Go 1.22:
+
+```text
+/path
+GET /path
+GET /users/{id}
+GET /files/{path...}
+example.com/path
+GET example.com/path
+```
+
+`http.ServeMux` remains authoritative for:
+
+- method matching, including GET and HEAD behavior;
+- host matching;
+- single-segment and remainder wildcards;
+- `Request.PathValue` and `Request.Pattern`;
+- path cleaning and redirects;
+- invalid-pattern and conflicting-pattern detection;
+- 404, 405, and `Allow` generation.
+
+Handle performs only basic early checks: an empty pattern, nil handler, or nil `http.HandlerFunc` panics immediately. Full pattern validation happens during Build when patterns are passed to `http.ServeMux.Handle`.
+
+### Duplicate declarations
+
+Router has an explicit replacement policy during configuration:
+
+- A later Handle or HandleFunc with the same pattern string replaces the previous handler.
+- A later Mount with the same normalized prefix replaces the previous child Router.
+- `/api` and `/api/` normalize to the same mount prefix.
+- Different pattern strings that conflict according to ServeMux still panic during Build.
+
+This replacement policy allows configuration to be corrected before publication without retaining duplicate declarations.
+
+### Mounting
+
+Mount prefixes are paths, not full ServeMux patterns. A missing leading slash is added, `/api/` becomes `/api`, and `/` remains the root prefix.
+
+```go
+api := h3.NewRouter()
+api.HandleFunc("GET /health", health)
+
+root := h3.NewRouter()
+root.Mount("/api", api)
+root.Build()
+// Compiled pattern: GET /api/health
+```
+
+Mounting expands child patterns during compilation. It does not use `http.StripPrefix`. Consequently:
+
+- the handler receives the original request URL, such as `/api/health`;
+- `r.Pattern` contains the complete compiled pattern, such as `GET /api/health`;
+- parent middleware wraps child middleware;
+- nested prefixes are accumulated.
+
+Host-qualified child patterns retain their method and host while only the path is prefixed:
+
+```go
+tenant := h3.NewRouter()
+tenant.HandleFunc("GET example.com/users", users)
+
+root.Mount("/api", tenant)
+root.Build()
+// Compiled pattern: GET example.com/api/users
+```
+
+In the standard pattern `GET api/users`, `GET` is the method, `api` is the host, and `/users` is the path. A method-qualified path without a host must begin with `/`, for example `GET /api/users`. The Mount prefix itself is always interpreted as a path, so `Mount("api", child)` means `/api`.
+
+Mount panics for an empty prefix, nil child, direct cycle, or indirect cycle. The same child may otherwise participate in declarations according to the caller's single-writer configuration discipline.
+
+Building a parent does not publish a standalone routing snapshot into its children. A child that must also serve independently needs its own `child.Build()` call.
+
+### Middleware
+
+Middleware uses the standard shape:
+
+```go
+func requestLog(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        log.Printf("start %s %s", r.Method, r.URL.Path)
+        next.ServeHTTP(w, r)
+        log.Printf("finish %s %s", r.Method, r.URL.Path)
+    })
+}
+
+router.Use(requestLog)
+```
+
+Earlier middleware is outermost. With middleware A then B, execution is:
+
+```text
+A before -> B before -> handler -> B after -> A after
+```
+
+Parent Router middleware is outside child Router middleware.
+
+Middleware factories run during `Build` or `CompileRoutes`, once for each final route during each compilation. They do not run for each request. A factory may therefore construct immutable or concurrency-safe shared state, but request-local mutable state must be created inside the returned handler's `ServeHTTP` call.
+
+Passing nil to Use panics immediately. A middleware factory that returns nil panics during compilation.
+
+### CompileRoutes
+
+`CompileRoutes` returns complete declarations without publishing a ServeMux:
+
+```go
+routes := router.CompileRoutes()
+for _, route := range routes {
+    mux.Handle(route.Pattern, route.Handler)
+}
+```
+
+Every returned Route has all mount prefixes expanded and all applicable middleware already composed. Result order is undefined because Router declarations are stored in maps. Do not use the order as route priority; ServeMux determines matching by pattern specificity.
+
+Most applications should call Build. CompileRoutes is for integration with another facility that accepts standard ServeMux-compatible patterns and handlers.
+
+### Router concurrency contract
+
+Router deliberately follows a single-writer configuration and multiple-reader serving model:
+
+- Do not concurrently call Use, Handle, HandleFunc, Mount, or Build with configuration writes.
+- A published Router can serve concurrent requests.
+- Build may run alongside request serving when no declaration is being modified.
+- Request dispatch atomically loads one immutable ServeMux and performs no Router lock acquisition.
+
+This is not an omission that can be fixed by locking one map. Recursive mounts, shared children, and user middleware factories would require tree-wide ownership, snapshots, and ordering rules. h3 keeps startup-oriented configuration explicit and the request path lock-free.
+
+## App
+
+App combines a root Router, server options, optional fallback handlers, and registered Servlet resources. App itself implements both `http.Handler` and `Servlet`.
+
+### Route methods
+
+`App.Use`, `App.Handle`, and `App.HandleFunc` delegate to the root Router. Their changes follow Router publication semantics. `App.Start` calls `Router.Build` automatically before listening.
+
+`App.Handler` queries the currently published root snapshot. `App.ServeHTTP` routes a request through the App's preselected fallback entry point and wraps the supplied writer with `NewResponse`.
+
+Serving an App before Start is possible as an `http.Handler`, but declarations must first be published with `Options.Router.Build`; otherwise its Router returns 404.
+
+### Server options
+
+Options maps the following values to `http.Server`:
+
+| h3 option | Meaning |
+| --- | --- |
+| `Addr` | TCP listen address; empty uses `:http` |
+| `PassOptionsStar` | true passes special `OPTIONS *` to App; false lets net/http answer it |
+| `TLSConfig` | non-nil enables `ServeTLS` |
+| `ReadTimeout` | maximum duration for reading the full request |
+| `ReadHeaderTimeout` | maximum duration for reading request headers |
+| `WriteTimeout` | response write timeout |
+| `IdleTimeout` | keep-alive idle timeout |
+| `MaxHeaderBytes` | maximum request-header bytes |
+| `TLSNextProto` | ALPN protocol takeover hooks |
+| `ConnState` | connection-state callback |
+| `ErrorLog` | server diagnostics and unexpected serving errors |
+| `HTTP2` | Go HTTP/2 configuration; subject to the Go standard library's current support |
+| `Protocols` | accepted HTTP protocol set |
+
+`PassOptionsStar` affects the server-level `OPTIONS *` request only. It does not alter ordinary path routes such as `OPTIONS /users`.
+
+### Start sequence
+
+`Start(ctx)` is non-blocking after successful initialization. It performs these operations synchronously before returning:
+
+1. Reject a second Start while the App is running.
+2. Check startup Context cancellation.
+3. validate and normalize the listen address;
+4. validate that a non-nil TLSConfig has a certificate entry point;
+5. Build and publish the root Router;
+6. create the TCP listener, making occupied-port and permission errors directly observable;
+7. start registered Servlets in registration order, checking Context cancellation before and after each Start;
+8. create an App-owned runtime Context based on `context.Background`;
+9. start the HTTP or HTTPS serving loop and unified cleanup goroutines.
+
+If a Servlet Start returns an error or panics, App closes the listener and stops already started Servlets in reverse order. The original startup error is returned. Rollback Stop failures are logged and do not replace the startup error. A cancelled startup Context produces the same rollback behavior.
+
+Invalid or conflicting routes panic during Router.Build, matching the configuration-error behavior of `http.ServeMux.Handle`.
+
+### Startup Context semantics
+
+The Context passed to Start owns startup and initialization only. Servlet Start implementations should honor it for checks such as database connectivity.
+
+- Cancellation observed before Start completes aborts and rolls back startup.
+- Cancellation after Start returns successfully does not stop App, its requests, or its Servlets.
+- Runtime request base Context is owned by App and derives from `context.Background`.
+- Runtime shutdown is initiated by Stop or by the HTTP serving loop exiting.
+
+This separation prevents a caller's deferred startup cancellation from accidentally cancelling all future requests.
+
+### Stop and cleanup
+
+`Stop()`:
+
+1. returns nil immediately when App is not running;
+2. requests the current serving cycle to stop;
+3. calls `http.Server.Shutdown` to stop accepting new requests and wait for active handlers;
+4. waits for the serving loop to exit;
+5. stops every Servlet in reverse registration order;
+6. joins Shutdown, serving, and Servlet Stop errors;
+7. clears the running-cycle marker so the same App may be started again;
+8. returns the combined error before invoking the completion callback.
+
+Stop has no timeout parameter. It may wait for long-running handlers or Servlet Stop methods. Applications that own long-lived or hijacked connections and background resources must define their own termination policy inside those resources.
+
+Servlet Start and Stop panics are converted to errors at the App lifecycle boundary so that cleanup of the remaining Servlets can continue.
+
+### Sequential lifecycle contract
+
+App lifecycle is intentionally sequential and lock-free:
+
+- one application control flow must own Start, Stop, Register, Run, and lifecycle-related configuration;
+- do not call Start and Stop concurrently;
+- do not call Register while App is running;
+- Start while running returns an error;
+- Stop while stopped returns nil;
+- after Stop completes, the same App may be started again.
+
+This restriction does not affect concurrent HTTP request handling. A mutex cannot choose a meaningful order for concurrent user lifecycle transitions or make Servlet implementations safe, so h3 requires an explicit owner instead.
+
+### OnStopped
+
+`Options.OnStopped` is called once for every successfully started serving cycle, after the HTTP service exits and all Servlets have stopped:
+
+```go
+OnStopped: func(manual bool, err error) {
+    if manual {
+        log.Printf("application stopped: %v", err)
+    } else {
+        log.Printf("HTTP service exited unexpectedly: %v", err)
+    }
+},
+```
+
+- `manual` is true only when App.Stop initiated cleanup.
+- `err` joins serving, Shutdown, and Servlet Stop errors.
+- direct startup failures returned by Start do not invoke OnStopped.
+- Start captures the callback for that serving cycle.
+- Stop waits for HTTP and Servlet cleanup but does not wait for OnStopped to return.
+- App is restartable before the callback returns, so a slow callback may overlap the next cycle.
+
+Treat OnStopped as notification, not a second resource-cleanup hook. Use Servlet.Stop for cleanup.
+
+### Run
+
+`Run(ctx, app)` is a blocking wrapper around Start plus completion notification. It temporarily wraps an existing OnStopped callback, waits until that callback has run, and returns the cycle's combined error. It restores the configured callback after Start captures it.
+
+Run is useful for a development main function or another entry point that wants to block until the application finishes. It shares App's sequential lifecycle rule and must not run concurrently with Start, Stop, or lifecycle configuration.
+
+The Run Context has exactly the same startup-only semantics as Start. Cancelling it after successful startup does not make Run return.
+
+## Routing-layer 404 and 405 fallbacks
+
+A standalone Router keeps the standard text responses from `http.ServeMux`. App can replace only routing-layer 404 and 405 responses:
+
+```go
+func jsonError(status int, code string) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json; charset=utf-8")
+        w.WriteHeader(status)
+        _ = json.NewEncoder(w).Encode(map[string]any{
+            "ok":   false,
+            "code": code,
+        })
+    })
+}
+
+app := h3.New(h3.Options{
+    Router:           router,
+    NotFound:         jsonError(http.StatusNotFound, "NotFound"),
+    MethodNotAllowed: jsonError(http.StatusMethodNotAllowed, "MethodNotAllowed"),
+})
+```
+
+Behavioral guarantees:
+
+- ServeMux still performs the route match and decides 404 versus 405.
+- A custom MethodNotAllowed handler sees the ServeMux-generated `Allow` header.
+- `Request.Pattern` remains empty inside routing fallback handlers, matching ServeMux's unmatched state.
+- The fallback handler receives an `h3.Response` writer.
+- A matched route that deliberately writes 404 or 405 is not replaced.
+- path-cleaning redirects and other special ServeMux responses are preserved.
+- a nil fallback keeps the standard response for that status.
+- when both fallbacks are nil, New selects Router directly and no fallback response wrapper is created.
+
+Custom fallback handlers must write their intended status themselves; merely writing a body implies 200 according to normal `net/http` behavior.
+
+Fallback handlers sit at the App boundary and are not registered Routes. Router.Use middleware does not wrap them automatically. Wrap the fallback handler explicitly, or wrap App externally, when route misses also need application logging, tracing, authentication, or headers.
+
+When custom fallbacks are enabled, unmatched ServeMux output is briefly buffered so the status can be classified before anything is committed. Matched handlers write directly to the underlying Response and are not body-buffered.
+
+## Component
+
+Component separates route modularity from resource lifecycle:
+
+```go
+type Component interface {
+    Prefix() string
+    Router() *Router
+}
+```
+
+`NewComponent(prefix)` returns a basic Component with an empty child Router.
+
+```go
+component := h3.NewComponent("/users")
+component.Router().HandleFunc("GET /", listUsers)
+component.Router().HandleFunc("GET /{id}", getUser)
+app.Register(component)
+```
+
+Register mounts the Component Router under its normalized prefix. A Component that also implements Servlet is added to App's lifecycle list.
+
+Register panics when:
+
+- the Component is nil;
+- App is currently running;
+- the normalized prefix is already present in the root Router, including a route mount configured directly.
+
+Duplicate component prefixes are rejected rather than replaced because replacing only routes could leave an older Servlet resource in the lifecycle list and split route ownership from resource ownership.
+
+When defining a richer component, embed `h3.Component`, not `*h3.Component`, because Component is an interface:
+
+```go
+type workerComponent struct {
+    h3.Component
+}
+
+func newWorkerComponent() *workerComponent {
+    component := &workerComponent{Component: h3.NewComponent("/workers")}
+    component.Router().HandleFunc("GET /status", workerStatus)
+    return component
+}
+```
+
+## Servlet
+
+Servlet is the optional resource lifecycle contract:
+
+```go
+type Servlet interface {
+    Start(ctx context.Context) error
+    Stop() error
+}
+```
+
+Typical Servlet resources include database pools, message-queue clients, caches, scheduled jobs, and background workers.
+
+App semantics:
+
+- Start methods run in component registration order before HTTP serving begins.
+- Stop methods run in reverse registration order after HTTP serving ends.
+- each successfully started Servlet receives one Stop call from App for that cycle;
+- a failed or cancelled startup rolls back only the successfully started prefix;
+- lifecycle panics become errors;
+- stop errors are joined rather than stopping later cleanup.
+
+Servlet should use its Context only for startup work. Long-running goroutines need their own runtime cancellation signal, which Servlet.Stop should trigger.
+
+h3 does not impose a Servlet state machine or promise that arbitrary Servlet implementations are idempotent or concurrency-safe. Implement those properties when the resource has additional owners or usage requirements.
+
+## Response
+
+### Purpose and creation
+
+Response decorates `http.ResponseWriter` with final metadata:
+
+```go
+response := h3.NewResponse(w)
+next.ServeHTTP(response, r)
+
+log.Printf(
+    "status=%d size=%d committed=%t",
+    response.Status(),
+    response.Size(),
+    response.Committed(),
+)
+```
+
+App automatically wraps the writer before dispatch. A standalone Router deliberately does not wrap it. `NewResponse` is idempotent: if the writer already implements h3.Response, the same value is returned.
+
+Initial state is:
+
+```text
+Status()    = 200
+Size()      = 0
+Committed() = false
+```
+
+`WriteHeader(code)` records and forwards the first final status. Later calls are ignored and logged. `Write(p)` implicitly commits status 200 when needed and increments Size by the number of bytes the underlying writer reports as written.
+
+Metadata is updated only when writes pass through Response. Writes made directly through `Unwrap` bypass Response metadata.
+
+### Optional HTTP capabilities
+
+Response implements these interfaces for compatibility with code that uses direct type assertions:
+
+- `http.Flusher`
+- `http.Hijacker`
+- `http.Pusher`
+
+Their availability still depends on the underlying writer:
+
+- Hijack uses `http.NewResponseController(...).Hijack()` and returns an error when unsupported.
+- Flush uses `http.NewResponseController(...).Flush()` and panics when the underlying writer reports `http.ErrNotSupported`, because `http.Flusher.Flush` has no error return.
+- Push returns an error when the underlying writer does not implement `http.Pusher`.
+- Unwrap returns the directly wrapped writer and enables `http.ResponseController` to continue unwrapping.
+
+### Interim responses and advanced protocols
+
+Response models one final response, not a sequence of interim 1xx responses. Write `100 Continue` or `103 Early Hints` directly through Unwrap, then write the final response through Response:
+
+```go
+response := w.(h3.Response)
+response.Unwrap().WriteHeader(http.StatusEarlyHints)
+response.WriteHeader(http.StatusOK)
+```
+
+Advanced protocol code may use Unwrap or `http.ResponseController` for capabilities outside h3's small wrapper. Final writes made through the underlying writer are intentionally not reflected in Response metadata.
+
+### Response concurrency
+
+Response follows the standard single-handler ownership model and does not synchronize Header, WriteHeader, Write, or metadata fields. Locking only counters would not define valid HTTP commit and body ordering across goroutines. Code that generates response content concurrently must aggregate or synchronize before writing.
+
+## TLS
+
+A non-nil `Options.TLSConfig` makes App call `http.Server.ServeTLS`:
+
+```go
+certificate, err := tls.LoadX509KeyPair("server.crt", "server.key")
+if err != nil {
+    return err
+}
+
+app := h3.New(h3.Options{
+    Addr: ":8443",
+    TLSConfig: &tls.Config{
+        MinVersion:   tls.VersionTLS12,
+        Certificates: []tls.Certificate{certificate},
+    },
+})
+```
+
+Before listening, h3 requires at least one TLS certificate source:
+
+- a non-empty `Certificates` slice;
+- `GetCertificate`; or
+- `GetConfigForClient`.
+
+This validation checks only that a source exists. Whether a dynamic callback returns a usable certificate for a particular handshake remains the responsibility of `crypto/tls`.
+
+ServeTLS clones TLSConfig according to standard-library semantics. An empty Addr remains `:http`, so TLS applications normally choose an explicit HTTPS port.
+
+## Error and panic boundaries
+
+h3 distinguishes runtime failures from programmer configuration errors:
+
+| Situation | Result |
+| --- | --- |
+| Empty route pattern | panic during Handle/HandleFunc |
+| Nil route handler | panic during Handle/HandleFunc |
+| Nil middleware | panic during Use |
+| Middleware returns nil | panic during Build/CompileRoutes |
+| Invalid or conflicting ServeMux pattern | panic during Build |
+| Empty mount prefix, nil child, or mount cycle | panic during Mount |
+| Nil, duplicate, or runtime Component registration | panic during Register |
+| Invalid address, listen failure, invalid TLS setup | error from Start |
+| Startup Context cancellation | error from Start, with rollback |
+| Servlet Start error or panic | error from Start, with rollback |
+| Start while already running | error from Start |
+| Stop while not running | nil |
+| Shutdown, serving, or Servlet Stop failures | joined error from Stop/OnStopped/Run |
+| Unsupported Response Hijack or Push | returned error |
+| Unsupported Response Flush | panic |
+
+h3 does not recover panics from route handlers or middleware. The standard `net/http.Server` behavior or application recovery middleware remains responsible for request-time panics.
+
+## Integration patterns
+
+### Request-scoped values
+
+Use standard Context middleware:
+
+```go
+type requestIDKey struct{}
+
+func requestID(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        ctx := context.WithValue(r.Context(), requestIDKey{}, newRequestID())
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+```
+
+### Error-returning application handlers
+
+h3 handlers use `http.Handler`, so an application that prefers returned errors should adapt them explicitly at route registration:
+
+```go
+type AppHandler func(http.ResponseWriter, *http.Request) error
+
+func JSONHandler(handler AppHandler) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        if err := handler(w, r); err != nil {
+            writeJSONError(w, r, err)
+        }
+    }
+}
+
+router.HandleFunc("POST /users", JSONHandler(createUser))
+```
+
+Explicit adaptation keeps error ownership and response timing visible. It also lets outer middleware finish after the error response has been written.
+
+### Related focused packages
+
+- `go-slim.dev/binding` binds path, query, header, form, JSON, and XML input from `*http.Request`.
+- `go-slim.dev/middleware` provides reusable standard `net/http` middleware.
+- `go-slim.dev/nego` matches Content-Type and negotiates Accept values.
+
+These packages are optional and are not runtime dependencies of h3.
+
+## Explicit non-goals
+
+h3 intentionally does not provide:
+
+- a custom request or response Context;
+- DTO binding or validation;
+- JSON, XML, HTML, or text rendering helpers;
+- content negotiation;
+- a framework-wide error type or error handler;
+- authentication or authorization policy;
+- tracing or logging policy;
+- dependency injection;
+- runtime-safe concurrent Router mutation;
+- concurrent App lifecycle transitions;
+- a universal Servlet state machine;
+- complete emulation of every optional ResponseWriter capability;
+- tracking of interim responses or writes bypassing Response.
+
+These omissions keep h3 compatible with the standard library and allow applications to compose only the policies they need.
+
+## Common mistakes
+
+1. **Declaring routes without Build:** a standalone Router returns 404 until Build publishes its declarations.
+2. **Expecting configuration changes to apply immediately:** call Build again after Use, Handle, HandleFunc, or Mount.
+3. **Calling middleware factories per request:** h3 already calls factories during compilation; request state belongs inside the returned handler.
+4. **Using `http.StripPrefix` assumptions:** h3 expands mounted patterns and preserves the original request URL.
+5. **Treating `GET api/users` as a path:** according to ServeMux grammar, `api` is the host; write `GET /api/users` for a path.
+6. **Cancelling the startup Context to stop App:** cancellation after successful Start has no runtime effect; call Stop.
+7. **Running lifecycle methods concurrently:** App and Router configuration rely on a single control-plane writer.
+8. **Expecting Stop to wait for OnStopped:** Stop returns after resource cleanup and before callback completion; use Run or explicit synchronization.
+9. **Expecting Router middleware on fallback handlers:** NotFound and MethodNotAllowed sit outside registered routes.
+10. **Writing a fallback body without status:** normal net/http rules produce 200 unless the fallback calls WriteHeader.
+11. **Using standalone Router and expecting h3.Response:** App wraps writers; Router does not.
+12. **Writing through Unwrap and expecting metadata:** bypassed writes are not recorded.
+13. **Treating implemented optional interfaces as guaranteed support:** Flush, Hijack, and Push still depend on the underlying writer.
+
+## Source map
+
+- `router.go`: Router declarations, duplicate policy, mount expansion, middleware composition, CompileRoutes, Build, and atomic publication.
+- `app.go`: Options, App routing methods, Component registration, listener setup, HTTP/HTTPS serving, startup rollback, shutdown, and OnStopped.
+- `route_fallback.go`: optional routing-layer 404/405 interception and default-response preservation.
+- `response.go`: Response metadata and optional ResponseWriter capabilities.
+- `component.go`: Component and NewComponent.
+- `servlet.go`: Servlet lifecycle contract.
+- `util.go`: Run, lifecycle panic conversion, Router snapshot loading, and TLS validation.
+
+## Test map
+
+- `router_test.go`: standard route matching, path values, wildcards, middleware order, rebuilding, atomic replacement, host-aware mounts, duplicate replacement, invalid middleware, nil/cycle mounts, nested mounts, and standalone writer behavior.
+- `app_test.go`: App writer wrapping, middleware, components, duplicate ownership, listener errors, TLS, startup Context behavior, restart, graceful shutdown, Servlet errors, rollback, error joining, and reverse stop order.
+- `route_fallback_test.go`: default/custom 404 and 405, `Allow`, matched-route status preservation, and ServeMux redirects.
+- `response_test.go`: initial/final metadata, multiple writes, duplicate WriteHeader, idempotent wrapping, Flush, Hijack, Push, and unsupported capabilities.
+- `component_test.go`: basic components, route mounting, middleware, and multiple modules.
+- `servlet_test.go`: interface examples and representative resource lifecycle implementations.
+- `util_test.go`: Run completion, callback preservation, startup errors, stop errors, and panic conversion.
+
+## Verification
+
+```sh
+go test ./...
+go vet ./...
+go test -race ./...
+```

@@ -438,6 +438,15 @@ go vet ./...
 go test -race ./...
 ```
 
+跨框架路由基准位于独立模块中，因此不会改变 h3 主模块仅依赖标准库的边界：
+
+```sh
+cd benchmarks/router
+go test ./...
+go test -run '^$' -bench . -benchmem -count 5 > benchmark.txt
+go run ./cmd/report -input benchmark.txt -output benchmark.html
+```
+
 ## 许可证
 
 MIT，见 [LICENSE](LICENSE)。

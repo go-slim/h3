@@ -45,6 +45,7 @@ Important behavior:
 - [Fallback tests](https://github.com/go-slim/h3/blob/main/route_fallback_test.go): Custom/default 404 and 405 behavior, `Allow`, matched-route status preservation, and redirects.
 - [Response tests](https://github.com/go-slim/h3/blob/main/response_test.go): Metadata, idempotent wrapping, optional interfaces, and unsupported operations.
 - [Run tests](https://github.com/go-slim/h3/blob/main/util_test.go): Blocking completion, callback preservation, and final error propagation.
+- [Router benchmarks](https://github.com/go-slim/h3/tree/main/benchmarks/router): Isolated cross-framework comparisons with `net/http`, Echo, Gin, Chi, Macaron, and Fiber, including a self-contained HTML report generator.
 
 ## Related packages and standards
 

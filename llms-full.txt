@@ -780,6 +780,7 @@ These omissions keep h3 compatible with the standard library and allow applicati
 - `component.go`: Component and NewComponent.
 - `servlet.go`: Servlet lifecycle contract.
 - `util.go`: Run, lifecycle panic conversion, Router snapshot loading, and TLS validation.
+- `benchmarks/router`: isolated cross-framework router benchmark module and self-contained HTML report generator; its third-party dependencies do not belong to the h3 module.
 
 ## Test map
 
@@ -790,6 +791,7 @@ These omissions keep h3 compatible with the standard library and allow applicati
 - `component_test.go`: basic components, route mounting, middleware, and multiple modules.
 - `servlet_test.go`: interface examples and representative resource lifecycle implementations.
 - `util_test.go`: Run completion, callback preservation, startup errors, stop errors, and panic conversion.
+- `benchmarks/router`: correctness checks and in-process routing benchmarks for h3, net/http, Echo, Gin, Chi, Macaron, and Fiber.
 
 ## Verification
 
@@ -797,4 +799,14 @@ These omissions keep h3 compatible with the standard library and allow applicati
 go test ./...
 go vet ./...
 go test -race ./...
+```
+
+Run the isolated cross-framework benchmarks separately:
+
+```sh
+cd benchmarks/router
+go test ./...
+go test -run '^$' -bench . -benchmem -count 5
+go test -run '^$' -bench . -benchmem -count 5 > benchmark.txt
+go run ./cmd/report -input benchmark.txt -output benchmark.html
 ```

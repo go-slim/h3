@@ -489,6 +489,16 @@ go vet ./...
 go test -race ./...
 ```
 
+Cross-framework router benchmarks are isolated in their own module so the h3
+module remains standard-library-only:
+
+```sh
+cd benchmarks/router
+go test ./...
+go test -run '^$' -bench . -benchmem -count 5 > benchmark.txt
+go run ./cmd/report -input benchmark.txt -output benchmark.html
+```
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
